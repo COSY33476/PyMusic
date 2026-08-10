@@ -8,3 +8,10 @@ python3 /path/to/main.py
 ```
 python /path/to/main.py
 ```
+依赖
+
+Qt6.11
+
+Python3.*
+
+ffmpeg
