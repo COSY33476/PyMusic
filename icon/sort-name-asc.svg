@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- A→Z with up arrow -->
+  <text x="2" y="15" fill="#FFFFFF" font-size="9" font-family="sans-serif" font-weight="bold">A</text>
+  <text x="13" y="15" fill="#FFFFFF" font-size="9" font-family="sans-serif" font-weight="bold">Z</text>
+  <polygon points="12,2 8,8 16,8" fill="#FFFFFF"/>
+  <line x1="12" y1="8" x2="12" y2="12" stroke="#FFFFFF" stroke-width="2"/>
+</svg>
