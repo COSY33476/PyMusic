@@ -15,3 +15,5 @@ Qt6.11
 Python3.*
 
 ffmpeg
+
+![图片](/Test/icon.png "使用图片")
