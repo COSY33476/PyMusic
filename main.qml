@@ -109,6 +109,14 @@ ApplicationWindow {
     // 点击右上角 × 时隐藏到托盘（true）还是退出程序（false）
     property bool closeToTray: true
 
+    // ===== 封面刷新版本号 =====
+    // 重新下载封面会覆盖原文件，路径字符串不变，QML Image 的 source
+    // 绑定不会重新求值、Qt 图片缓存也不会重载同 URL 的图片，导致
+    // 界面一直显示旧封面。把版本号拼进 file:// URL 的 query
+    // （封面 ?c=N、背景 ?b=N、缩略图 ?t=N），换 URL 键强制重新加载。
+    // （实测 file:// 带 query 可正常加载，且 query 变化会触发重载）
+    property int coverStamp: 0
+
     function switchToLyric() {
         if (autoSwitchToLyric) {
             player.playlistVisible = false
@@ -208,14 +216,21 @@ ApplicationWindow {
     property bool _bgTransitioning: false
     // true：A 层是当前显示的前景；false：B 层是当前显示的前景
     property bool _frontIsA: true
+    // 过渡代数：每次开始/提前结束过渡都自增，旧过渡挂起的定时器
+    // 凭代数判断自己是否已失效，避免迟到地翻转前后景标记造成错乱
+    property int _bgToken: 0
 
-    // A 层：只作为 FastBlur 的取样源，不直接可见
+    // A 层：只作为 FastBlur 的取样源，不直接可见。
+    // 本地文件用同步加载（asynchronous: false）：切换歌曲时不会出现
+    // "中途被新 source 打断" 的异步加载应答，从根上消除
+    // "QQuickPixmap: connectFinished() called when not loading" 警告，
+    // 也让下面的 status 判断在赋值后立刻就是最终结果。
     Image {
         id: bgImageA
         anchors.fill: parent
         fillMode: Image.PreserveAspectCrop
         source: ""
-        asynchronous: true
+        asynchronous: false
         smooth: true
         visible: false
     }
@@ -226,7 +241,7 @@ ApplicationWindow {
         anchors.fill: parent
         fillMode: Image.PreserveAspectCrop
         source: ""
-        asynchronous: true
+        asynchronous: false
         smooth: true
         visible: false
     }
@@ -270,6 +285,29 @@ ApplicationWindow {
         }
     }
 
+    // 监听封面文件更新（重新下载覆盖同路径文件时），提升版本号
+    // 强制所有图片重新加载。
+    // 注意：不能简单地再调一次 _startBgTransition()——onSongChanged 已经
+    // 触发过一次过渡，这里再叠加一次会让 A/B 状态机和挂起的 650ms 定时器
+    // 互相竞争，正是"下载封面后背景消失"的原因。正确做法是：前景层显示的
+    // 就是这张封面时，就地重载（换带新版本号的 URL），不做过渡。
+    Connections {
+        target: player
+        function onCoverFileUpdated(path) {
+            window.coverStamp++
+            var cur = player.currentSongImage
+            var frontImg = window._frontImage()
+            // 与本次下载前的 URL 精确比较（url 类型没有 indexOf，
+            // 且模糊子串匹配可能误伤路径相近的其它歌曲封面）
+            var prevUrl = "file://" + cur + "?b=" + (window.coverStamp - 1)
+            if (cur && String(frontImg.source) === prevUrl) {
+                frontImg.source = "file://" + cur + "?b=" + window.coverStamp
+            } else {
+                window._startBgTransition()
+            }
+        }
+    }
+
     // 当前“前景层”的 Image / FastBlur（只读快捷方式，避免重复三元判断）
     function _frontImage() { return window._frontIsA ? bgImageA : bgImageB }
     function _frontBlur() { return window._frontIsA ? bgBlurA : bgBlurB }
@@ -278,18 +316,25 @@ ApplicationWindow {
 
     // 开始背景图片渐变过渡
     function _startBgTransition() {
+        // 背景层使用独立的 query key（?b=），与封面图（?c=）、底栏缩略图
+        // （?t=）不同 URL——三个 Image 各自持有独立的加载应答，避免 Qt
+        // 图片缓存共享同一 QQuickPixmap 应答、一层被中止加载时其它层收到
+        // "connectFinished() called when not loading" 之类的告警。
         var newSource = player.currentSongImage
-            ? "file://" + player.currentSongImage : ""
+            ? "file://" + player.currentSongImage + "?b=" + window.coverStamp : ""
 
         var frontImg = window._frontImage()
         var frontBlur = window._frontBlur()
         var backImg = window._backImage()
         var backBlur = window._backBlur()
 
-        // 情况 1：正在过渡中 → 立即完成当前过渡（交换前后景标记），再用新图重新开始
-        // 注意：这里不清空、不腾挪任何 source，只是交换 opacity 和标记位，
-        // 因此不会有任何一层因为 source 被清空而瞬间消失。
+        // 情况 1：正在过渡中 → 立即完成当前过渡（交换前后景标记），再用新图重新开始。
+        // 先自增代数：让上一个过渡挂起的 650ms 定时器作废，防止它迟到后
+        // 再次翻转标记；同时断开两层的挂起连接，防止串层回调。
         if (window._bgTransitioning) {
+            window._bgToken++
+            bgImageA.statusChanged.disconnect(window._bgOnLoad)
+            bgImageB.statusChanged.disconnect(window._bgOnLoad)
             frontBlur.opacity = 0.0
             backBlur.opacity = 1.0
             window._frontIsA = !window._frontIsA
@@ -300,7 +345,9 @@ ApplicationWindow {
         }
 
         // 情况 2：新图与当前前景相同 → 无需过渡
-        if (newSource === frontImg.source)
+        // 注意必须用 String() 转换再比较：frontImg.source 是 url 类型，
+        // url 与 string 用 === 比较永远为 false，会导致同图也重复过渡。
+        if (newSource === String(frontImg.source))
             return
 
         // 确保前景持有旧图（如果是首次启动，前景还没图，直接设置前景）
@@ -328,8 +375,11 @@ ApplicationWindow {
 
     // 后景层图片加载完成后的回调（一次性）
     function _bgOnLoad() {
+        // 无论触发的是哪一层，都先把两层挂起的连接全部断开，
+        // 防止历史连接在新过渡里串层触发。
+        bgImageA.statusChanged.disconnect(window._bgOnLoad)
+        bgImageB.statusChanged.disconnect(window._bgOnLoad)
         var backImg = window._backImage()
-        backImg.statusChanged.disconnect(window._bgOnLoad)
         if (backImg.status === Image.Ready) {
             window._doBgFade()
         } else {
@@ -340,18 +390,23 @@ ApplicationWindow {
     // 执行渐变：前景（旧图）淡出、后景（新图）淡入
     function _doBgFade() {
         window._bgTransitioning = true
+        window._bgToken++
+        var token = window._bgToken
         window._frontBlur().opacity = 0.0
         window._backBlur().opacity = 1.0
 
-        // 650ms 后完成过渡（比动画 600ms 稍长）
+        // 650ms 后完成过渡（比动画 600ms 稍长）。
+        // 定时器回调带上自己的代数，只有仍是最新过渡时才翻转标记。
         var timer = Qt.createQmlObject(
-            "import QtQuick; Timer { interval: 650; onTriggered: { window._finishBgTransition(); } }",
+            "import QtQuick; Timer { interval: 650; onTriggered: { window._finishBgTransition(" + token + "); } }",
             window)
         timer.start()
     }
 
     // 完成过渡：只交换前后景标记，不改动任何 source，不清空任何一层
-    function _finishBgTransition() {
+    function _finishBgTransition(token) {
+        if (token !== window._bgToken)
+            return  // 这个过渡已被更早完成/替换，忽略迟到的回调
         window._frontIsA = !window._frontIsA
         window._bgTransitioning = false
     }
@@ -436,8 +491,8 @@ ApplicationWindow {
                                 id: coverImage
                                 anchors.fill: parent
                                 fillMode: Image.PreserveAspectCrop
-                                source: player.currentSongImage ? "file://" + player.currentSongImage : ""
-                                asynchronous: true
+                                source: player.currentSongImage ? "file://" + player.currentSongImage + "?c=" + window.coverStamp : ""
+                                asynchronous: false
                                 smooth: true
                                 visible: status === Image.Ready
                             }
@@ -1506,8 +1561,8 @@ ApplicationWindow {
                             Image {
                                 anchors.fill: parent
                                 fillMode: Image.PreserveAspectCrop
-                                source: coverImage.source
-                                asynchronous: true
+                                source: player.currentSongImage ? "file://" + player.currentSongImage + "?t=" + window.coverStamp : ""
+                                asynchronous: false
                                 smooth: true
                             }
                         }

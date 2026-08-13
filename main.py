@@ -10,6 +10,8 @@ from pathlib import Path
 import re
 import json
 import time
+import hashlib
+import threading
 from api import search_songs, save_lyric_file, save_cover_file
 
 from PySide6.QtCore import (
@@ -25,6 +27,13 @@ MUSIC_DIR = Path("~/Music").expanduser()
 SUPPORTED_AUDIO = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".wma", ".ape")
 SUPPORTED_IMAGE = (".jpg", ".jpeg", ".png", ".bmp")
 
+# AppImage 打包时自带的 ffmpeg/ffplay/ffprobe 位于 <app>/bin/，
+# 把它们放到 PATH 最前面，保证优先使用与程序一起打包的版本；
+# 目录不存在（源码运行）时不做任何改动，回退到系统 PATH。
+_BUNDLED_BIN = Path(__file__).parent / "bin"
+if _BUNDLED_BIN.is_dir():
+    os.environ["PATH"] = str(_BUNDLED_BIN) + os.pathsep + os.environ.get("PATH", "")
+
 
 def _to_path(path_str):
     """Normalize a path string to a Path object with cross-platform support.
@@ -35,8 +44,12 @@ def _to_path(path_str):
     return Path(str(path_str).replace("\\", "/"))
 
 
-def find_matching_image(song_path):
-    """Find an image file that matches the song filename."""
+def find_matching_image(song_path, dir_images=None):
+    """Find an image file that matches the song filename.
+
+    dir_images: 可选，该目录下已列好的图片文件列表（由 scan_music 缓存传入，
+    避免同一目录下每首歌都重复 iterdir 一遍，加快扫描速度）。
+    """
     song_path = _to_path(song_path)
     song_dir = song_path.parent
     song_name = song_path.name
@@ -57,17 +70,16 @@ def find_matching_image(song_path):
             candidates.append(candidate)
 
     # 3. Partial match: image base name is a substring of song base name or vice versa
-    all_images = []
-    try:
-        dir_entries = list(song_dir.iterdir())
-    except (FileNotFoundError, OSError):
-        dir_entries = []
-    for f in dir_entries:
-        f_lower = f.name.lower()
-        if any(f_lower.endswith(ext) for ext in SUPPORTED_IMAGE):
-            all_images.append(f)
+    if dir_images is None:
+        try:
+            dir_images = [
+                f for f in song_dir.iterdir()
+                if any(f.name.lower().endswith(ext) for ext in SUPPORTED_IMAGE)
+            ]
+        except (FileNotFoundError, OSError):
+            dir_images = []
 
-    for img_path in all_images:
+    for img_path in dir_images:
         if img_path in candidates:
             continue
         img_base = img_path.stem
@@ -114,21 +126,60 @@ def find_matching_lyrics(song_path):
     return ""
 
 
+def _looks_like_jpeg(path):
+    """检查文件是否以 JPEG 魔数 (FF D8) 开头"""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\xff\xd8"
+    except OSError:
+        return False
+
+
 def extract_embedded_image(song_path):
-    """Extract embedded cover art from audio file using ffmpeg."""
+    """Extract embedded cover art from audio file using ffmpeg.
+
+    缓存文件名由「文件绝对路径 + mtime + 大小」哈希而来：
+    - 旧实现只按文件名 stem 命名（mp2_<stem>.jpg），不同目录下同名歌曲
+      会命中同一缓存文件，导致封面互相串图；
+    - 音频被重新打标签（内嵌封面变化）后 mtime/大小会变，自动重新提取。
+
+    先尝试 -vcodec copy 无损拷贝：内嵌封面是 JPEG 时速度最快。
+    如果拷贝结果不是有效 JPEG（内嵌的是 PNG/BMP 时，copy 会把原始
+    字节流直接塞进 .jpg 容器，生成损坏文件），回退为重新编码成 JPEG。
+    """
+    song_path = _to_path(song_path)
+    try:
+        st = song_path.stat()
+        key = f"{song_path.resolve()}:{st.st_mtime}:{st.st_size}"
+    except OSError:
+        key = str(song_path.resolve())
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+
     temp_dir = Path(tempfile.gettempdir())
-    base = _to_path(song_path).stem
-    output_path = temp_dir / f"mp2_{base}.jpg"
+    output_path = temp_dir / f"mp2_{digest}.jpg"
 
     # Return cached if already extracted
     if output_path.is_file() and output_path.stat().st_size > 0:
         return str(output_path)
 
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["ffmpeg", "-y", "-i", song_path, "-an", "-vcodec", "copy", str(output_path)],
             capture_output=True, timeout=15
         )
+        copied_ok = (
+            proc.returncode == 0
+            and output_path.is_file()
+            and output_path.stat().st_size > 0
+            and _looks_like_jpeg(output_path)
+        )
+        if not copied_ok:
+            # 非 JPEG 内嵌封面：重新编码为 JPEG（mjpeg 编码器）
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", song_path, "-an", "-vcodec", "mjpeg",
+                 "-q:v", "3", str(output_path)],
+                capture_output=True, timeout=15
+            )
         if output_path.is_file() and output_path.stat().st_size > 0:
             return str(output_path)
     except Exception:
@@ -246,30 +297,56 @@ def extract_song_metadata(song_path):
 
 
 def scan_music(dir_path=None):
-    """Scan the music directory for audio files and images."""
+    """Scan the music directory for audio files and images.
+
+    注意：这里只做快速文件扫描，不调用 ffprobe 提取元数据——元数据提取
+    由 AudioPlayer._start_metadata_enrichment 在后台线程异步完成，
+    避免大曲库启动扫描时长时间卡死 UI。
+    """
     if dir_path is None:
         dir_path = MUSIC_DIR
+
+    # 每个目录只列一次图片文件，避免同目录下每首歌都重复 iterdir
+    image_cache = {}
+
+    def _dir_images(directory):
+        if directory not in image_cache:
+            try:
+                entries = list(directory.iterdir())
+            except (FileNotFoundError, OSError):
+                entries = []
+            image_cache[directory] = [
+                f for f in entries
+                if any(f.name.lower().endswith(ext) for ext in SUPPORTED_IMAGE)
+            ]
+        return image_cache[directory]
+
     songs = []
     for ext in SUPPORTED_AUDIO:
         for fpath in sorted(dir_path.glob("*" + ext)):
-            img = find_matching_image(str(fpath))
-
-            # 优先使用嵌入元数据作为歌曲名，格式："歌曲名 - 作者"
-            title, artist = extract_song_metadata(str(fpath))
-            if title and artist:
-                name = f"{title} - {artist}"
-            elif title:
-                name = title
-            else:
-                name = fpath.stem
-
             songs.append({
                 "path": str(fpath),
-                "name": name,
-                "image": img,
+                "name": fpath.stem,
+                "image": find_matching_image(str(fpath), _dir_images(fpath.parent)),
                 "mtime": fpath.stat().st_mtime,
             })
     return songs
+
+
+def build_song_name(song_path):
+    """优先使用内嵌元数据作为歌曲显示名（"标题 - 作者"），否则回退到文件名 stem。"""
+    song_path = _to_path(song_path)
+    title, artist = extract_song_metadata(str(song_path))
+    if title and artist:
+        return f"{title} - {artist}"
+    if title:
+        return title
+    return song_path.stem
+
+
+class _TaskSignals(QObject):
+    """后台任务完成信号：finished(task_id, ok, result)。"""
+    finished = Signal(int, bool, object)
 
 
 class AudioPlayer(QObject):
@@ -288,9 +365,18 @@ class AudioPlayer(QObject):
     downloadStatusChanged = Signal()  # download status text changed
     searchResultModelChanged = Signal()  # search results changed
     volumeChanged = Signal(int)          # volume changed
+    coverFileUpdated = Signal(str)       # 封面文件内容已更新（路径不变），用于刷新 QML 图片缓存
 
     def __init__(self, parent=None):
         super().__init__(parent)
+
+        # 后台任务调度：网络请求/元数据提取都在线程中执行，避免阻塞 UI。
+        # 线程里 emit 的信号会因接收者（本对象，位于 GUI 线程）自动排队投递，
+        # 所以回调 _on_task_finished 一定在主线程执行。
+        self._task_signals = _TaskSignals(self)
+        self._task_signals.finished.connect(self._on_task_finished)
+        self._task_counter = 0
+        self._task_callbacks = {}
 
         # 音乐目录与歌曲列表
         self._music_dir = MUSIC_DIR
@@ -329,6 +415,11 @@ class AudioPlayer(QObject):
         self._search_results = []
         self._download_status = ""
 
+        # 内嵌封面异步提取缓存（避免 ffmpeg 阻塞 GUI 线程）
+        self._embedded_cover_cache = {}
+        self._pending_cover_extract = set()
+        self._embedded_cover_failed = set()
+
         # 配置文件路径
         self._config_dir = Path.home() / ".config" / "PyMusic"
         self._config_file = self._config_dir / "PyMusic.config"
@@ -341,6 +432,9 @@ class AudioPlayer(QObject):
                 self._volume = max(0, min(100, int(settings["volume"])))
         except Exception:
             pass
+
+        # 启动后台元数据补全（文件名先建列表，ffprobe 结果异步回填）
+        self._start_metadata_enrichment()
 
     # ========== 歌曲信息查询 ==========
 
@@ -400,6 +494,7 @@ class AudioPlayer(QObject):
             self.songListChanged.emit()
             self.songChanged.emit(-1)
             self.musicDirChanged.emit()
+            self._start_metadata_enrichment()
 
     # ========== 当前播放索引 ==========
 
@@ -507,63 +602,116 @@ class AudioPlayer(QObject):
 
     @Slot(str)
     def searchNetEase(self, keywords):
-        """搜索网易云歌曲"""
+        """搜索网易云歌曲（后台线程执行，不阻塞 UI）"""
         if not keywords.strip():
             self._download_status = "请输入搜索关键词"
             self.downloadStatusChanged.emit()
             return
         self._download_status = f"正在搜索: {keywords}..."
         self.downloadStatusChanged.emit()
-        try:
-            self._search_results = search_songs(keywords)
-            self._download_status = f"找到 {len(self._search_results)} 首歌曲"
-        except Exception as e:
+        self._run_task(lambda: search_songs(keywords), self._on_search_done)
+
+    def _on_search_done(self, ok, result):
+        """搜索完成回调（GUI 线程）"""
+        if ok:
+            self._search_results = result
+            self._download_status = f"找到 {len(result)} 首歌曲"
+        else:
             self._search_results = []
-            self._download_status = f"搜索失败: {e}"
+            self._download_status = f"搜索失败: {result}"
         self.searchResultModelChanged.emit()
         self.downloadStatusChanged.emit()
 
     @Slot(int, str)
     def downloadLyric(self, song_id, current_path):
-        """下载歌词到当前歌曲目录"""
+        """下载歌词到当前歌曲目录（后台线程执行，不阻塞 UI）"""
         if not current_path:
             self._download_status = "没有当前播放歌曲"
             self.downloadStatusChanged.emit()
             return
+        target_path = str(_to_path(current_path))
         self._download_status = "正在下载歌词..."
         self.downloadStatusChanged.emit()
-        try:
-            result = save_lyric_file(song_id, current_path)
-            if result:
-                self._download_status = f"歌词已保存: {Path(result).name}"
+        self._run_task(
+            lambda: save_lyric_file(song_id, target_path),
+            lambda ok, res: self._on_lyric_downloaded(ok, res, target_path),
+        )
+
+    def _on_lyric_downloaded(self, ok, result, target_path):
+        """歌词下载完成回调（GUI 线程）"""
+        if ok and result:
+            self._download_status = f"歌词已保存: {Path(result).name}"
+            # 下载期间可能已切歌，仅当目标仍是当前播放歌曲时才重载歌词
+            if 0 <= self._current_index < len(self._songs) \
+                    and self._songs[self._current_index]["path"] == target_path:
                 self._load_lyrics()
-            else:
-                self._download_status = "未找到歌词"
-        except Exception as e:
-            self._download_status = f"下载歌词失败: {e}"
+        elif ok:
+            self._download_status = "未找到歌词"
+        else:
+            self._download_status = f"下载歌词失败: {result}"
         self.downloadStatusChanged.emit()
 
     @Slot(str, str, int)
     def downloadCover(self, pic_url, current_path, song_id=0):
-        """下载封面图片到当前歌曲目录"""
+        """下载封面图片到当前歌曲目录（后台线程执行，不阻塞 UI）"""
         if not current_path:
             self._download_status = "没有当前播放歌曲"
             self.downloadStatusChanged.emit()
             return
+        target_path = str(_to_path(current_path))
         self._download_status = "正在下载封面..."
         self.downloadStatusChanged.emit()
-        try:
-            result = save_cover_file(song_id, pic_url, current_path)
-            if result:
-                self._download_status = f"封面已保存: {Path(result).name}"
-                if 0 <= self._current_index < len(self._songs):
-                    self._songs[self._current_index]["image"] = result
-                    self.songChanged.emit(self._current_index)
-            else:
-                self._download_status = "未找到封面"
-        except Exception as e:
-            self._download_status = f"下载封面失败: {e}"
+        self._run_task(
+            lambda: save_cover_file(song_id, pic_url, target_path),
+            lambda ok, res: self._on_cover_downloaded(ok, res, target_path),
+        )
+
+    def _on_cover_downloaded(self, ok, result, target_path):
+        """封面下载完成回调（GUI 线程）"""
+        if ok and result:
+            self._download_status = f"封面已保存: {Path(result).name}"
+            # 按路径匹配目标歌曲（下载期间可能已切歌，不能只依赖 currentIndex）
+            for i, song in enumerate(self._songs):
+                if song["path"] == target_path:
+                    song["image"] = result
+                    self.songChanged.emit(i)
+                    # 重新下载会覆盖同路径的旧封面：路径字符串不变，QML 的
+                    # Image source 绑定不会重算，Qt 图片缓存也不会重载。
+                    # 这里发出专门信号，让 QML 提升版本号强制刷新。
+                    self.coverFileUpdated.emit(result)
+                    break
+        elif ok:
+            self._download_status = "未找到封面"
+        else:
+            self._download_status = f"下载封面失败: {result}"
         self.downloadStatusChanged.emit()
+
+    # ========== 后台任务调度 ==========
+
+    def _run_task(self, fn, on_done):
+        """在守护线程中执行 fn（阻塞式 I/O/网络操作），完成后在 GUI 线程回调 on_done(ok, result)。
+
+        线程中 emit 的 Qt 信号因接收者（_task_signals 的父对象，即本播放器）
+        位于 GUI 线程而自动排队投递，因此 on_done 一定在主线程执行，
+        可以安全操作 UI 状态。
+        """
+        self._task_counter += 1
+        task_id = self._task_counter
+        self._task_callbacks[task_id] = on_done
+
+        def worker():
+            try:
+                self._task_signals.finished.emit(task_id, True, fn())
+            except Exception as e:
+                self._task_signals.finished.emit(task_id, False, e)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_task_finished(self, task_id, ok, result):
+        """后台任务完成（GUI 线程）：取出并执行对应回调。"""
+        cb = self._task_callbacks.pop(task_id, None)
+        if cb is not None:
+            cb(ok, result)
 
     # ========== 内部排序 ==========
 
@@ -594,6 +742,35 @@ class AudioPlayer(QObject):
                         self._current_index = i
                         self.songChanged.emit(i)
                     break
+
+    def _start_metadata_enrichment(self):
+        """后台异步提取所有歌曲的标题/作者元数据，完成后回填列表并重新排序。
+
+        启动时同步跑 ffprobe 会导致大曲库长时间卡死 UI，所以先快速建列表，
+        再在后台线程批量补全元数据。回写时按路径匹配，即使期间切换了目录
+        或排序，也不会把结果错填到别的歌曲上。
+        """
+        snapshot = [(i, s["path"]) for i, s in enumerate(self._songs)]
+        if not snapshot:
+            return
+
+        def work():
+            return [(i, path, build_song_name(path)) for i, path in snapshot]
+
+        self._run_task(work, self._on_metadata_enriched)
+
+    def _on_metadata_enriched(self, ok, result):
+        """元数据补全完成回调（GUI 线程）"""
+        if not ok:
+            return
+        changed = False
+        for i, path, name in result:
+            if 0 <= i < len(self._songs) and self._songs[i]["path"] == path \
+                    and name and self._songs[i]["name"] != name:
+                self._songs[i]["name"] = name
+                changed = True
+        if changed:
+            self._sort_songs()
 
     # ========== ffplay 进程管理 ==========
 
@@ -683,7 +860,9 @@ class AudioPlayer(QObject):
         # 进程已经被切换/停止，放弃重试
         if process_ref is not self._process:
             return
-        if process_ref.state() != QProcess.Running:
+        # Starting 状态视为可重试：ffplay 可能还没完成启动（不再有
+        # waitForStarted 兜底），只有 NotRunning 才彻底放弃
+        if process_ref.state() == QProcess.NotRunning:
             return
 
         if self._adjust_volume_pa():
@@ -724,7 +903,9 @@ class AudioPlayer(QObject):
             filepath,
         ]
         self._process.start("ffplay", args[1:])
-        self._process.waitForStarted(500)
+        # 不调用 waitForStarted()：它会阻塞 GUI 线程最多 500ms，
+        # 正是切歌时"轻微卡顿"的来源之一。进程启动交给事件循环处理，
+        # PA 音量纠正本来就是异步重试，不受影响。
         self._process.finished.connect(self._on_ffplay_finished)
 
         if use_pa:
@@ -738,10 +919,11 @@ class AudioPlayer(QObject):
             this_process = self._process
             self._retry_pa_volume(this_process, attempt=0)
 
-        # 异步获取时长，避免阻塞 UI
+        # 异步获取时长与歌词，避免 ffprobe 阻塞 UI
         self._duration = 0.0
         self.durationChanged.emit(self._duration)
-        QTimer.singleShot(0, lambda: self._async_load_metadata(filepath))
+        self._async_load_metadata(filepath)
+        self._load_lyrics()
 
         self._seek_base = seek_to
         self._play_start_time = self._get_current_time()
@@ -749,10 +931,22 @@ class AudioPlayer(QObject):
         self._position_timer.start()
 
     def _async_load_metadata(self, filepath):
-        """异步加载歌曲元数据（时长和歌词），避免阻塞 UI 线程"""
-        self._duration = self._get_duration(filepath)
-        self.durationChanged.emit(self._duration)
-        self._load_lyrics()
+        """后台线程加载歌曲时长（ffprobe），完成后在 GUI 线程回调。
+
+        旧实现虽然名字叫 async，实际是在 GUI 线程同步 subprocess.run，
+        ffprobe 冷启动 50~200ms，正是切歌卡顿的主因。
+        """
+        self._run_task(
+            lambda: self._get_duration(filepath),
+            lambda ok, res: self._on_duration_loaded(filepath, ok, res),
+        )
+
+    def _on_duration_loaded(self, filepath, ok, duration):
+        """时长加载完成（GUI 线程）：仅当仍是当前歌曲时才应用"""
+        if ok and 0 <= self._current_index < len(self._songs) \
+                and self._songs[self._current_index]["path"] == filepath:
+            self._duration = float(duration) if duration else 0.0
+            self.durationChanged.emit(self._duration)
 
     def _get_current_time(self):
         """获取当前系统时间戳（用于计算播放进度）"""
@@ -777,17 +971,37 @@ class AudioPlayer(QObject):
         """定时更新播放进度位置，触发信号通知 QML"""
         if self._state == "playing":
             elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
-            self._position = min(self._seek_base + elapsed, self._duration)
+            # 时长未知（异步 ffprobe 还没返回）时先不 clamp，避免进度条卡在 0
+            if self._duration > 0:
+                self._position = min(self._seek_base + elapsed, self._duration)
+            else:
+                self._position = self._seek_base + elapsed
             self.positionChanged.emit(self._position)
             self._update_lyric_index()
 
     def _on_ffplay_finished(self, exit_code, exit_status):
         """ffplay 进程结束时自动切换到下一曲"""
         self._position_timer.stop()
-        # If the process was killed by us (switching songs), don't auto-advance
-        if exit_status == QProcess.NormalExit and self._state != "stopped":
-            if self._position >= self._duration - 1.0:
-                self.next()
+        # 只处理自然退出（我们自己杀进程切歌时已提前断开本信号）
+        if exit_status != QProcess.NormalExit or self._state == "stopped":
+            return
+
+        # 退出码非 0 说明 ffplay 报错退出（文件损坏/解码失败等）。此时若继续
+        # 自动切歌，会在坏文件之间无限循环，直接放弃自动切换。
+        if exit_code != 0:
+            return
+
+        # 时长已知时按播放进度判断是否接近结尾；时长未知（异步 ffprobe 还没
+        # 返回，_duration 为 0）时按实际播放时长判断——否则
+        # "position >= duration - 1.0" 在 duration 为 0 时恒成立，
+        # 会在一开始播放就误触发切歌。
+        if self._duration > 0:
+            near_end = self._position >= self._duration - 1.0
+        else:
+            elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
+            near_end = elapsed >= 1.0
+        if near_end:
+            self.next()
 
     @Slot()
     def play(self):
@@ -891,7 +1105,11 @@ class AudioPlayer(QObject):
         """跳转到指定播放位置（秒）"""
         if self._current_index < 0:
             return
-        self._position = max(0.0, min(pos_seconds, self._duration))
+        # 时长未知时不按 0 clamp，否则进度会被错误压到 0
+        if self._duration > 0:
+            self._position = max(0.0, min(pos_seconds, self._duration))
+        else:
+            self._position = max(0.0, pos_seconds)
         self._update_lyric_index()
         if self._state != "stopped":
             filepath = self._songs[self._current_index]["path"]
@@ -904,12 +1122,21 @@ class AudioPlayer(QObject):
                 self._state = "paused"
                 self.stateChanged.emit("paused")
                 self._position_timer.stop()
-                # Wait for process to start, then pause
+                # ffplay 一启动就挂起（SIGSTOP）。不用 waitForStarted 阻塞等待，
+                # 改由 started 信号触发，避免拖拽进度条时 UI 卡顿。
                 if self._process:
-                    self._process.waitForStarted(500)
-                    pid = self._process.processId()
-                    if pid > 0:
-                        os.kill(pid, signal.SIGSTOP)
+                    self._process.started.connect(self._pause_new_process)
+
+    def _pause_new_process(self):
+        """seek 暂停场景：ffplay 启动完成即刻挂起。仅当仍处于暂停态时生效，
+        防止用户在 started 到达前点了播放导致误停新进程。"""
+        if self._state != "paused" or not self._process:
+            return
+        if self._process.state() == QProcess.NotRunning:
+            return
+        pid = self._process.processId()
+        if pid > 0:
+            os.kill(pid, signal.SIGSTOP)
 
     @Slot(int)
     def setVolume(self, vol):
@@ -927,14 +1154,44 @@ class AudioPlayer(QObject):
 
     @Property(str, notify=songChanged)
     def currentSongImage(self):
-        """返回当前歌曲的封面图片路径（QML 可绑定）"""
+        """返回当前歌曲的封面图片路径（QML 可绑定）
+
+        内嵌封面提取（ffmpeg，50~300ms）不再同步执行：首次访问时发起
+        后台提取，完成后通过 songChanged 通知 QML 重新求值。提取失败
+        的歌曲会被记住，避免反复空跑 ffmpeg。
+        """
         if 0 <= self._current_index < len(self._songs):
             song = self._songs[self._current_index]
             if song["image"]:
                 return song["image"]
-            # Lazy extract embedded image on demand
-            return extract_embedded_image(song["path"])
+            cached = self._embedded_cover_cache.get(song["path"], "")
+            if cached:
+                return cached
+            # Lazy extract embedded image on demand (后台线程)
+            self._request_embedded_cover(song["path"])
         return ""
+
+    def _request_embedded_cover(self, song_path):
+        """发起后台内嵌封面提取（同一首歌只发起一次）"""
+        if song_path in self._pending_cover_extract \
+                or song_path in self._embedded_cover_failed:
+            return
+        self._pending_cover_extract.add(song_path)
+        self._run_task(
+            lambda: extract_embedded_image(song_path),
+            lambda ok, res: self._on_cover_extracted(song_path, ok, res),
+        )
+
+    def _on_cover_extracted(self, song_path, ok, result):
+        """内嵌封面提取完成（GUI 线程）"""
+        self._pending_cover_extract.discard(song_path)
+        if not ok or not result:
+            self._embedded_cover_failed.add(song_path)
+            return
+        self._embedded_cover_cache[song_path] = result
+        if 0 <= self._current_index < len(self._songs) \
+                and self._songs[self._current_index]["path"] == song_path:
+            self.songChanged.emit(self._current_index)
 
     @Property(str, notify=songChanged)
     def currentSongName(self):
@@ -962,20 +1219,39 @@ class AudioPlayer(QObject):
     # ========== 歌词相关 ==========
 
     def _load_lyrics(self):
-        """加载当前歌曲的歌词，优先加载外部 LRC 文件，其次读取嵌入元数据"""
+        """加载当前歌曲的歌词（后台线程执行）。
+
+        内嵌歌词需要跑 ffprobe（每次 50~200ms），旧实现在 GUI 线程同步
+        调用，是切歌卡顿的主因之一。现在先立刻清空旧歌词（避免新歌显示
+        上一首的歌词），再后台加载，完成后回填。
+        """
         self._lyrics = []
         self._current_lyric_index = -1
-        if 0 <= self._current_index < len(self._songs):
-            song_path = self._songs[self._current_index]["path"]
-            # Try external LRC file first
-            lrc_path = find_matching_lyrics(song_path)
-            if lrc_path:
-                self._lyrics = parse_lrc(lrc_path)
-            else:
-                # Fall back to embedded lyrics
-                self._lyrics = extract_embedded_lyrics(song_path)
         self.lyricsChanged.emit()
         self.lyricIndexChanged.emit(-1)
+        if 0 <= self._current_index < len(self._songs):
+            song_path = self._songs[self._current_index]["path"]
+            self._run_task(
+                lambda: self._read_lyrics(song_path),
+                lambda ok, res: self._on_lyrics_loaded(song_path, ok, res),
+            )
+
+    def _read_lyrics(self, song_path):
+        """后台线程：优先读取外部 LRC 文件，其次读取内嵌元数据"""
+        lrc_path = find_matching_lyrics(song_path)
+        if lrc_path:
+            return parse_lrc(lrc_path)
+        return extract_embedded_lyrics(song_path)
+
+    def _on_lyrics_loaded(self, song_path, ok, lyrics):
+        """歌词加载完成（GUI 线程）：仅当仍是当前歌曲时才应用，避免快速
+        切歌时旧歌词错填到新歌上。"""
+        if ok and 0 <= self._current_index < len(self._songs) \
+                and self._songs[self._current_index]["path"] == song_path:
+            self._lyrics = lyrics or []
+            self._current_lyric_index = -1
+            self.lyricsChanged.emit()
+            self.lyricIndexChanged.emit(-1)
 
     @Property(int, notify=lyricsChanged)
     def lyricCount(self):
