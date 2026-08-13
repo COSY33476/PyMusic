@@ -1,0 +1,85 @@
+name: Build AppImage
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'main.py'
+      - 'api.py'
+      - 'main.qml'
+      - 'icons/**'
+      - '.github/workflows/build-appimage.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appimage-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install python-appimage
+        run: pipx install python-appimage
+
+      - name: Download static ffmpeg/ffplay/ffprobe (BtbN)
+        run: |
+          mkdir -p appdir/pymusic/bin
+          curl -sL -o ffmpeg.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar xf ffmpeg.tar.xz
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg \
+             ffmpeg-master-latest-linux64-gpl/bin/ffplay \
+             ffmpeg-master-latest-linux64-gpl/bin/ffprobe \
+             appdir/pymusic/bin/
+
+      - name: Assemble app bundle
+        run: |
+          mkdir -p appdir/PyMusic
+          cp main.py api.py main.qml appdir/pymusic/
+          cp -r icons appdir/pymusic/
+          cp icons/LOGO.png appdir/PyMusic/PyMusic.png
+          # 注意：desktop 里的 python3.14 与下方基础镜像版本绑定，
+          # 换基础镜像时需同步修改
+          cat > appdir/PyMusic/PyMusic.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=PyMusic
+          Comment=PySide6 + QML music player
+          Exec="\${APPDIR}/usr/bin/python3.14 \${APPDIR}/pymusic/main.py"
+          Icon=PyMusic
+          Categories=AudioVideo;Audio;Player;
+          DESKTOP
+          cat > appdir/PyMusic/entrypoint.sh <<'ENTRY'
+          #! /bin/bash
+          exec {{ python-executable }} "${APPDIR}/pymusic/main.py" "$@"
+          ENTRY
+          chmod +x appdir/PyMusic/entrypoint.sh
+          printf 'PySide6\nPySide6-Addons\nrequests\n' > appdir/PyMusic/requirements.txt
+
+      - name: Download base Python AppImage
+        run: |
+          curl -sL -o base.AppImage \
+            https://github.com/niess/python-appimage/releases/download/python3.14/python3.14.7-cp314-cp314-manylinux_2_28_x86_64.AppImage
+          chmod +x base.AppImage
+
+      - name: Build AppImage
+        run: |
+          python-appimage build app appdir/PyMusic -b base.AppImage -x appdir/pymusic
+          ls -lh PyMusic-x86_64.AppImage
+
+      - name: Upload to nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view nightly >/dev/null 2>&1 || \
+            gh release create nightly --prerelease \
+              --title "Nightly AppImage" \
+              --notes "main 分支每次推送自动构建的最新版本"
+          gh release upload nightly PyMusic-x86_64.AppImage --clobber
