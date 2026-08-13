@@ -65,9 +65,6 @@ jobs:
 
       - name: Download base Python AppImage
         run: |
-          # 注意：文件名必须保持 python<版本>-<tag>-<平台>.AppImage 格式，
-          # python-appimage 靠正则从文件名解析 Python 版本，改名会报
-          # "Invalide base image"
           curl -sL -o python3.14.7-cp314-cp314-manylinux_2_28_x86_64.AppImage \
             https://github.com/niess/python-appimage/releases/download/python3.14/python3.14.7-cp314-cp314-manylinux_2_28_x86_64.AppImage
           chmod +x python3.14.7-cp314-cp314-manylinux_2_28_x86_64.AppImage
@@ -85,6 +82,6 @@ jobs:
         run: |
           gh release view nightly >/dev/null 2>&1 || \
             gh release create nightly --prerelease \
-              --title "Nightly AppImage" \
-              --notes "main 分支每次推送自动构建的最新版本"
+              --title "AppImage auto build" \
+              --notes "new release"
           gh release upload nightly PyMusic-x86_64.AppImage --clobber
