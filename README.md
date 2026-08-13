@@ -8,6 +8,12 @@ python3 /path/to/main.py
 ```
 python /path/to/main.py
 ```
+
+以及
+```
+chmod +x /path/to/main.py
+# 然后双击运行
+```
 依赖
 
 Qt6.11
