@@ -117,6 +117,19 @@ ApplicationWindow {
     // （实测 file:// 带 query 可正常加载，且 query 变化会触发重载）
     property int coverStamp: 0
 
+    // ===== 输入框聚焦检测 =====
+    // 任何输入框（搜索框、设置路径、字体名等）获得焦点时禁用全局快捷键：
+    // 否则在搜索框打字时按空格会误触播放/暂停，按左右方向键移动光标
+    // 会误触 seek（还会重启 ffplay）。activeFocusItem 有变更通知，
+    // 绑定会在焦点转移时自动重新求值。
+    readonly property bool _isTyping: {
+        var f = window.activeFocusItem
+        return f !== null && (f instanceof TextInput || f instanceof TextField)
+    }
+
+    // 下载面板搜索框是否被用户手动编辑过（编辑过则不再随切歌自动刷新预填内容）
+    property bool _searchBoxEdited: false
+
     function switchToLyric() {
         if (autoSwitchToLyric) {
             player.playlistVisible = false
@@ -219,6 +232,9 @@ ApplicationWindow {
     // 过渡代数：每次开始/提前结束过渡都自增，旧过渡挂起的定时器
     // 凭代数判断自己是否已失效，避免迟到地翻转前后景标记造成错乱
     property int _bgToken: 0
+    // 当前过渡挂起的完成定时器实例（每次过渡重建并销毁旧实例，
+    // 否则 createQmlObject 出来的 Timer 会随切歌次数无限累积）
+    property var _bgTimer: null
 
     // A 层：只作为 FastBlur 的取样源，不直接可见。
     // 本地文件用同步加载（asynchronous: false）：切换歌曲时不会出现
@@ -308,6 +324,17 @@ ApplicationWindow {
         }
     }
 
+    // 切歌时刷新下载面板搜索框的预填内容（搜索框的 text 绑定在用户
+    // 手动编辑过一次后就会断开，之后不再跟随当前歌曲变化；这里在
+    // 用户从未编辑过的情况下补一次刷新）
+    Connections {
+        target: player
+        function onSongChanged(index) {
+            if (!window._searchBoxEdited)
+                searchInput.text = player.currentSongName || ""
+        }
+    }
+
     // 当前“前景层”的 Image / FastBlur（只读快捷方式，避免重复三元判断）
     function _frontImage() { return window._frontIsA ? bgImageA : bgImageB }
     function _frontBlur() { return window._frontIsA ? bgBlurA : bgBlurB }
@@ -333,6 +360,10 @@ ApplicationWindow {
         // 再次翻转标记；同时断开两层的挂起连接，防止串层回调。
         if (window._bgTransitioning) {
             window._bgToken++
+            if (window._bgTimer) {
+                window._bgTimer.destroy()
+                window._bgTimer = null
+            }
             bgImageA.statusChanged.disconnect(window._bgOnLoad)
             bgImageB.statusChanged.disconnect(window._bgOnLoad)
             frontBlur.opacity = 0.0
@@ -397,14 +428,23 @@ ApplicationWindow {
 
         // 650ms 后完成过渡（比动画 600ms 稍长）。
         // 定时器回调带上自己的代数，只有仍是最新过渡时才翻转标记。
+        // 每次过渡先销毁上一个定时器实例（QML destroy 为延迟销毁，安全），
+        // 避免 createQmlObject 出的 Timer 对象随切歌次数累积泄漏。
+        if (window._bgTimer)
+            window._bgTimer.destroy()
         var timer = Qt.createQmlObject(
             "import QtQuick; Timer { interval: 650; onTriggered: { window._finishBgTransition(" + token + "); } }",
             window)
+        window._bgTimer = timer
         timer.start()
     }
 
     // 完成过渡：只交换前后景标记，不改动任何 source，不清空任何一层
     function _finishBgTransition(token) {
+        if (window._bgTimer) {
+            window._bgTimer.destroy()
+            window._bgTimer = null
+        }
         if (token !== window._bgToken)
             return  // 这个过渡已被更早完成/替换，忽略迟到的回调
         window._frontIsA = !window._frontIsA
@@ -2864,6 +2904,7 @@ ApplicationWindow {
                             font.pixelSize: 13
                             clip: true
                             text: player.currentSongName || ""
+                            onTextEdited: window._searchBoxEdited = true
                         }
                     }
 
@@ -3096,7 +3137,7 @@ ApplicationWindow {
                     radius: 4
                     color: fontDialog._selectedFont === modelData
                         ? accent
-                        : (mouseArea.containsMouse ? Qt.rgba(1,1,1,0.08) : "transparent")
+                        : (fontMouse.containsMouse ? Qt.rgba(1,1,1,0.08) : "transparent")
 
                     Text {
                         anchors.verticalCenter: parent.verticalCenter
@@ -3110,7 +3151,7 @@ ApplicationWindow {
                     }
 
                     MouseArea {
-                        id: mouseArea
+                        id: fontMouse
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
@@ -3178,7 +3219,15 @@ ApplicationWindow {
     // ===== 文件夹选择对话框 =====
     FolderDialog {
         id: folderDialog
-        onAccepted: musicDirInput.text = selectedFolder.toString().replace("file://", "")
+        onAccepted: {
+            // selectedFolder.toString() 返回的是 URL（如 file:///home/user/My%20Music），
+            // 必须去掉 file:// 前缀并做百分号解码——否则含空格/中文的路径
+            // 会带着 %20 等编码写进输入框，setMusicDir 判断目录不存在而静默失败
+            var urlStr = selectedFolder.toString()
+            if (urlStr.indexOf("file://") === 0)
+                urlStr = urlStr.slice("file://".length)
+            musicDirInput.text = decodeURIComponent(urlStr)
+        }
     }
 
     
@@ -3251,21 +3300,35 @@ ApplicationWindow {
     }
 
     // ========== 键盘快捷键 ==========
+    // enabled 绑定 _isTyping：输入框获得焦点时不拦截按键，
+    // 避免打字时误触播放/seek
     Shortcut {
         sequence: "Space"
+        enabled: !window._isTyping
         onActivated: player.playPause()
     }
     Shortcut {
         sequence: "Right"
-        onActivated: player.seek(Math.min(player.position + 5, player.duration))
+        enabled: !window._isTyping
+        onActivated: {
+            // 时长未知（异步加载未完成）时不能按 0 clamp，否则会 seek 到 0:00
+            var target = player.position + 5
+            if (player.duration > 0)
+                target = Math.min(target, player.duration)
+            player.seek(target)
+        }
     }
     Shortcut {
         sequence: "Left"
+        enabled: !window._isTyping
         onActivated: player.seek(Math.max(player.position - 5, 0))
     }
 
     onSettingsVisibleChanged: {
         if (settingsVisible) {
+            // 快速关闭再打开时，之前启动的关闭计时器必须取消，
+            // 否则计时器到期会把刚重新打开的面板隐藏
+            settingsCloseTimer.stop()
             settingsOverlay.visible = true
         } else {
             settingsCloseTimer.start()
@@ -3274,6 +3337,7 @@ ApplicationWindow {
 
     onDownloadVisibleChanged: {
         if (downloadVisible) {
+            downloadCloseTimer.stop()
             downloadOverlay.visible = true
         } else {
             downloadCloseTimer.start()
