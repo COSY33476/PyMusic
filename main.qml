@@ -14,9 +14,11 @@ ApplicationWindow {
     title: "PyMusic"
     color: darkMode ? "#1a1a2e" : "#f0f0f2"
 
-    // 点击 × 时：根据 closeToTray 决定隐藏到托盘还是退出
+    // 点击 × 时：根据 closeToTray 决定隐藏到托盘还是退出。
+    // 系统没有可用托盘时（部分精简桌面环境），隐藏窗口会导致程序
+    // 无任何入口可恢复，必须直接退出。
     onClosing: function(closeEvent) {
-        if (closeToTray) {
+        if (closeToTray && appBridge.trayAvailable) {
             closeEvent.accepted = false
             window.hide()
         } else {
@@ -118,13 +120,17 @@ ApplicationWindow {
     property int coverStamp: 0
 
     // ===== 输入框聚焦检测 =====
-    // 任何输入框（搜索框、设置路径、字体名等）获得焦点时禁用全局快捷键：
-    // 否则在搜索框打字时按空格会误触播放/暂停，按左右方向键移动光标
-    // 会误触 seek（还会重启 ffplay）。activeFocusItem 有变更通知，
-    // 绑定会在焦点转移时自动重新求值。
+    // 任何可聚焦控件获得焦点时禁用全局快捷键。除输入框（打字时空格/
+    // 方向键）外，Qt 的 QShortcutMap 会在焦点控件收到按键之前拦截事件：
+    // - Slider 聚焦时按 ←/→：本该调节滑块值，却触发 seek（重启 ffplay）
+    // - Button 聚焦时按空格：本该激活按钮，却触发播放/暂停
+    // activeFocusItem 有变更通知，绑定会在焦点转移时自动重新求值。
     readonly property bool _isTyping: {
         var f = window.activeFocusItem
-        return f !== null && (f instanceof TextInput || f instanceof TextField)
+        if (f === null)
+            return false
+        return f instanceof TextInput || f instanceof TextField
+            || f instanceof Slider || f instanceof Button
     }
 
     // 下载面板搜索框是否被用户手动编辑过（编辑过则不再随切歌自动刷新预填内容）
@@ -381,6 +387,29 @@ ApplicationWindow {
         if (newSource === String(frontImg.source))
             return
 
+        // 情况 2.5：新歌没有封面 → 淡出背景。
+        // 不能直接清空 source：FastBlur 的 visible 绑定在 source 清空时
+        // 会瞬间变 false，没有淡出动画。先淡出 opacity，动画结束后再清空。
+        if (newSource === "") {
+            window._bgTransitioning = true
+            window._bgToken++
+            var clearToken = window._bgToken
+            bgImageA.statusChanged.disconnect(window._bgOnLoad)
+            bgImageB.statusChanged.disconnect(window._bgOnLoad)
+            if (window._bgTimer) {
+                window._bgTimer.destroy()
+                window._bgTimer = null
+            }
+            frontBlur.opacity = 0.0
+            backBlur.opacity = 0.0
+            var clearTimer = Qt.createQmlObject(
+                "import QtQuick; Timer { interval: 620; onTriggered: { window._finishBgClear(" + clearToken + "); } }",
+                window)
+            window._bgTimer = clearTimer
+            clearTimer.start()
+            return
+        }
+
         // 确保前景持有旧图（如果是首次启动，前景还没图，直接设置前景）
         if (frontImg.source === "") {
             frontImg.source = newSource
@@ -448,6 +477,20 @@ ApplicationWindow {
         if (token !== window._bgToken)
             return  // 这个过渡已被更早完成/替换，忽略迟到的回调
         window._frontIsA = !window._frontIsA
+        window._bgTransitioning = false
+    }
+
+    // 无封面淡出动画结束：此刻两层 FastBlur 已完全透明，清空 source 无感。
+    // token 校验防止动画期间又切了歌（交给新过渡处理）。
+    function _finishBgClear(token) {
+        if (window._bgTimer) {
+            window._bgTimer.destroy()
+            window._bgTimer = null
+        }
+        if (token !== window._bgToken)
+            return
+        bgImageA.source = ""
+        bgImageB.source = ""
         window._bgTransitioning = false
     }
 
@@ -686,10 +729,23 @@ ApplicationWindow {
                             ScrollBar.vertical: ScrollBar {
                                 policy: ScrollBar.AlwaysOn
                                 width: 12
+
+                                // 滑块主题跟随：颜色显式绑定 window.accent（含
+                                // customAccent 变化），轨道底色跟随 darkMode，
+                                // 且都带过渡动画——否则切换主题/强调色时只有
+                                // 这里瞬间跳变或保持旧样式，与其余控件不同步。
                                 contentItem: Rectangle {
+                                    implicitWidth: 12
                                     radius: 6
-                                    color: accent
+                                    color: window.accent
                                     opacity: 0.7
+                                    Behavior on color { ColorAnimation { duration: 150 } }
+                                }
+                                background: Rectangle {
+                                    implicitWidth: 12
+                                    radius: 6
+                                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(0, 0, 0, 0.06)
+                                    Behavior on color { ColorAnimation { duration: 150 } }
                                 }
                             }
 
@@ -1001,33 +1057,28 @@ ApplicationWindow {
                             // "行间距"这个设置影响。所以这里用一个不依赖 rowSpacing 的固定
                             // 像素值，且限制在一个合理范围内（不会比 itemHeight 本身还大，
                             // 否则两行看起来反而比组间距更松散，失去"贴近"的效果）。
-                            readonly property real groupInnerGap: Math.min(30, itemHeight * 0.75)
+                            // 组内间距上限提到 40px：Text 允许 Wrap 两行
+                            // （14px × 1.3 × 2 ≈ 36px），之前上限 30px 会让
+                            // 长原文/译文两行文字互相压字。仍保持"不大于
+                            // itemHeight"的约束，不会比组间距更松散。
+                            readonly property real groupInnerGap: Math.min(40, itemHeight)
 
                             property var groupOf: []
                             property var indexInGroup: []
-                            property var groupSize: []
                             // groupBaseY[g]：第 g 组"组内第 0 行"相对于第 0 组的累积偏移。
-                            //
-                            // 重要修正：这个值必须是"纯声明式绑定"，不能算好之后存成普通
-                            // 数值再也不更新——之前的版本里这个数组是在 rebuildGroups() 这个
-                            // 命令式函数内部用当时的 itemHeight 算出来、然后固定存下来的，
-                            // 只有 rebuildGroups() 被重新调用（即歌词切换时）才会重算。
-                            // 于是拖动"行间距"滑块改变 itemHeight 时，groupBaseY 完全不会
-                            // 跟着更新，但 currentTargetBase() 里其它用到 itemHeight 的地方
-                            // （比如 centerY - itemHeight * 0.5）却是实时绑定、立刻用新值——
-                            // 新旧 itemHeight 在同一个公式里混用，会让所有行的目标位置一起
-                            // 产生一个固定的偏移量，而 groupBaseY 数组内部各组之间的相对差值
-                            // 还是按旧 itemHeight 算的、彼此间距不变——这正是"整体跟着挪动，
-                            // 但相对距离锁死不变"这个 bug 的根源。
-                            //
-                            // 改成这样的 binding 表达式后，只要 itemHeight 或 groupCount
-                            // 变化，QML 会自动重新求值整个数组，永远和当前 itemHeight 同步。
+                            // 每组累加 itemHeight + groupInnerGap：组内 pair 占掉
+                            // groupInnerGap 后，"上一组译文 ↔ 下一组原文"的视觉间距
+                            // 恰好等于 itemHeight——既符合"rowSpacing 控制组与组
+                            // 距离"的设计意图，也和行序保护(C 方案)的跨组 minGap
+                            // (itemHeight) 完全一致。此前只累加 itemHeight，视觉
+                            // 跨组间距实际是 itemHeight - groupInnerGap，行序保护
+                            // 会把每组往下推一个 gap，导致居中误差随组号线性累积。
                             readonly property var groupBaseY: {
                                 var arr = []
                                 var base = 0
                                 for (var g = 0; g < groupCount; g++) {
                                     arr.push(base)
-                                    base += itemHeight
+                                    base += itemHeight + groupInnerGap
                                 }
                                 return arr
                             }
@@ -1039,11 +1090,30 @@ ApplicationWindow {
                                 (groupOf.length > player.currentLyricIndex && player.currentLyricIndex >= 0)
                                     ? groupOf[player.currentLyricIndex] : -1
 
+                            // ===== A 方案：大跨度跳转瞬间归位 =====
+                            // 逐组自然推进时 |Δ|≤1，保留弹簧错落手感；一次变化超过
+                            // 3 组说明是 seek/进度条 scrub 造成的大跳转——此时软弹簧
+                            // 追赶会让歌词堆瞬间坍缩叠成一团（实测最坏两行交叉
+                            // -376px），直接 snapAll 瞬间归位。
+                            property int _lastSnapGroup: -1
+                            onCurrentGroupIndexChanged: {
+                                var g = currentGroupIndex
+                                if (g < 0) {
+                                    // 歌词切换/清空：重置基准
+                                    _lastSnapGroup = -1
+                                    return
+                                }
+                                // 从无歌词状态直接落到远处（如恢复上次播放位置）也算大跳
+                                var jump = _lastSnapGroup < 0 ? g : Math.abs(g - _lastSnapGroup)
+                                if (jump > 3)
+                                    Qt.callLater(snapAll)
+                                _lastSnapGroup = g
+                            }
+
                             function rebuildGroups() {
                                 var count = player.lyricCount
                                 var gOf = []
                                 var iInG = []
-                                var gSize = []
                                 var g = -1
                                 var lastTime = null
                                 var curGroupStart = 0
@@ -1057,13 +1127,9 @@ ApplicationWindow {
                                     iInG.push(i - curGroupStart)
                                     lastTime = t
                                 }
-                                // 回填每组的行数 groupSize
-                                for (var gi = 0; gi <= g; gi++) gSize.push(0)
-                                for (var j = 0; j < count; j++) gSize[gOf[j]] += 1
 
                                 groupOf = gOf
                                 indexInGroup = iInG
-                                groupSize = gSize
                                 // groupCount 只依赖分组结构（歌词内容），不依赖 itemHeight；
                                 // 触发 groupBaseY 的 binding 重新求值靠的是它被读取时自动
                                 // 建立的依赖关系，这里赋值即可，具体的像素值交给上面的
@@ -1086,13 +1152,32 @@ ApplicationWindow {
                             // 保证滚轮手感跟手；只有回到"跟随播放自动滚动"时才启用
                             // 按距离错落延迟的效果。
                             property bool manualScrolling: false
+                            // 手动浏览开始那一刻的 currentLyricIndex。浏览期间
+                            // currentTargetBase 若继续跟随播放推进，整个歌词堆会
+                            // 移动、用户正在读的行会漂走——冻结基准，回中动画
+                            // 结束后再恢复跟随。
+                            property int manualBaseIndex: -1
+
+                            // 手动滚动的边界钳制：滚到第一行/最后一行到达中心
+                            // 即停，避免滚出歌词堆看到大片空白。
+                            // 堆总高度按 groupBaseY（含组内 gap）计算
+                            function clampManualOffset(v) {
+                                var g = currentGroupIndex >= 0 ? currentGroupIndex : 0
+                                var curBase = groupBaseY.length > g ? groupBaseY[g] : 0
+                                var lastBase = groupCount > 0 ? groupBaseY[groupCount - 1] : 0
+                                var upLimit = curBase + itemHeight
+                                var downLimit = Math.max(0, lastBase - curBase + itemHeight)
+                                return Math.max(-downLimit, Math.min(v, upLimit))
+                            }
 
                             function currentTargetBase(idx) {
                                 // 第 idx 行的基准 y：让"当前播放行所在组的组内第 0 行"
                                 // 居中于高亮区，其余行按 rowOffsetInStack 的相对偏移量
                                 // 跟随排布——这样无论 currentLyricIndex 命中的是原文还是
                                 // 译文，同一组的两行都会一起移动到高亮区附近。
-                                var curIdx = player.currentLyricIndex
+                                // 手动浏览期间用冻结的基准索引，防止自动滚动推动歌词堆。
+                                var curIdx = (lyricView.manualScrolling && lyricView.manualBaseIndex >= 0)
+                                    ? lyricView.manualBaseIndex : player.currentLyricIndex
                                 if (curIdx < 0 || groupOf.length === 0) {
                                     return centerY - itemHeight * 0.5 - (curIdx - idx) * itemHeight
                                 }
@@ -1135,16 +1220,33 @@ ApplicationWindow {
                                 // onFinished（Qt: finished() 不会在 stop() 手动打断时触发，
                                 // 只在动画自己跑完时触发），这样能准确区分
                                 // "回中动画正常走完" vs "被新的滚动打断"。
-                                onFinished: lyricView.manualScrolling = false
+                                onFinished: {
+                                    // 回中动画自然结束：恢复跟随播放自动滚动。
+                                    // 弹簧收敛时间常数(~3.6s)远大于 400ms 回中动画，
+                                    // 只切回跟随的话行还要再漂移 2 秒多才到当前播放行。
+                                    // 这里追加一次 snapAll，让所有行瞬间精确落位。
+                                    lyricView.manualScrolling = false
+                                    lyricView.manualBaseIndex = -1
+                                    Qt.callLater(lyricView.snapAll)
+                                }
                             }
 
-                            // 鼠标滚轮：手动浏览歌词，3 秒无操作后自动回到当前播放行
+                            // 鼠标滚轮：手动浏览歌词，3 秒无操作后自动回到当前播放行。
+                            // enabled 绑定歌词行数：没有歌词时（纯音乐）这个 handler
+                            // 会白白吞掉滚轮事件（默认 blocking），导致根部的
+                            // "全局滚轮音量"在右侧歌词区失效——没有行可滚时
+                            // 直接把事件放行给根部音量 handler。
                             WheelHandler {
                                 acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                enabled: player.lyricCount > 0
                                 onWheel: (event) => {
+                                    // 本次浏览会话开始时冻结自动滚动基准
+                                    if (!lyricView.manualScrolling)
+                                        lyricView.manualBaseIndex = player.currentLyricIndex
                                     lyricView.manualScrolling = true
                                     manualOffsetAnim.stop()
-                                    lyricView.manualOffset += event.angleDelta.y / 120 * rowSpacing
+                                    lyricView.manualOffset = lyricView.clampManualOffset(
+                                        lyricView.manualOffset + event.angleDelta.y / 120 * rowSpacing)
                                     resumeAutoScrollTimer.restart()
                                 }
                             }
@@ -1166,7 +1268,25 @@ ApplicationWindow {
                                     property int _groupIdx: lyricView.groupOf.length > index ? lyricView.groupOf[index] : index
                                     property int _idxInGroup: lyricView.indexInGroup.length > index ? lyricView.indexInGroup[index] : 0
 
-                                    y: targetY
+                                    // ===== C 方案：行序保护 =====
+                                    // 弹簧动画照常写到 _animY（手感完全不变），实际 y 用绑定
+                                    // 对 _animY 做下限钳制：任何时候都不会越过上一行的已动画
+                                    // 位置 + 最小间距，从根本上杜绝快速滚动/seek 跳转时因
+                                    // 相位错乱产生的行交叉与堆叠。正常跟随时钳制不触发，
+                                    // 弹簧轨迹原样呈现。
+                                    property real _animY: targetY
+                                    y: {
+                                        var t = _animY
+                                        if (index > 0) {
+                                            var prev = lyricRepeater.itemAt(index - 1)
+                                            if (prev) {
+                                                var minGap = (_idxInGroup > 0)
+                                                    ? lyricView.groupInnerGap : lyricView.itemHeight
+                                                t = Math.max(t, prev.y + minGap)
+                                            }
+                                        }
+                                        return t
+                                    }
                                     // ===== 错落跟随的核心：按"离当前播放组的距离"给延迟 =====
                                     // 之前的版本里所有行用完全相同的 SpringAnimation、
                                     // 且在同一 tick 收到新的 targetY，于是所有行的运动轨迹
@@ -1210,7 +1330,7 @@ ApplicationWindow {
                                     property int yDelay: lyricView.manualScrolling ? 0 : _rawDelay
 
                                     property alias yBehaviorEnabled: yBehavior.enabled
-                                    Behavior on y {
+                                    Behavior on _animY {
                                         id: yBehavior
                                         SequentialAnimation {
                                             PauseAnimation { duration: lyricRow.yDelay }
@@ -1365,10 +1485,32 @@ ApplicationWindow {
                             // "触发"绑定重新求值——做法是先记下 currentLyricIndex 相关的
                             // 依赖不变，直接调用 Qt.callLater 在下一帧关闭动画期间
                             // 让已经变化的 targetY 直接、无动画地写入 y（绑定本身仍然完整）。
+                            // 绑定辅助：为指定行创建 targetY 绑定。
+                            // 不能直接写 Qt.binding(function() { return row.targetY })——
+                            // 循环里的 var row 是函数级作用域，所有闭包共享同一个
+                            // 变量（循环结束后的最后一行），会导致每行的绑定都
+                            // 指向最后一行的 targetY。用参数传参为每次调用创建
+                            // 独立作用域。
+                            function bindTargetY(r) {
+                                return function() { return r.targetY }
+                            }
+
                             function snapAll() {
                                 for (var i = 0; i < lyricRepeater.count; i++) {
                                     var row = lyricRepeater.itemAt(i)
-                                    if (row) row.yBehaviorEnabled = false
+                                    if (row) {
+                                        row.yBehaviorEnabled = false
+                                        // Qt6 下仅把 Behavior 设为 disabled 不会打断
+                                        // 正在运行的弹簧动画（实测 _animY 仍停在旧值），
+                                        // 必须显式写入目标值再恢复绑定，才能瞬间归位。
+                                        row._animY = row.targetY
+                                        row._animY = Qt.binding(lyricView.bindTargetY(row))
+                                        // 行被复用给新歌词时重置距离缓存，避免 growing
+                                        // 方向判断沿用上一首歌的残留值导致首次缩放
+                                        // 动画 easing 方向错误
+                                        row._lastDistance = 999999
+                                        row.growing = false
+                                    }
                                 }
                                 // 关闭 Behavior 后，绑定已经把 y 更新为最新的 targetY
                                 // （因为 currentLyricIndex/manualOffset 早已变化，只是之前
@@ -1399,7 +1541,14 @@ ApplicationWindow {
                             Connections {
                                 target: player
                                 function onLyricsChanged() {
+                                    // 切歌：完整复位手动浏览状态——之前只重置 manualOffset，
+                                    // manualScrolling 残留 true 会把错落延迟禁用数秒，
+                                    // 3 秒计时器和回中动画还会继续跑一次无意义动画
                                     lyricView.manualOffset = 0
+                                    lyricView.manualScrolling = false
+                                    lyricView.manualBaseIndex = -1
+                                    resumeAutoScrollTimer.stop()
+                                    manualOffsetAnim.stop()
                                     lyricView.rebuildGroups()
                                     Qt.callLater(lyricView.snapAll)
                                 }
@@ -1477,7 +1626,12 @@ ApplicationWindow {
                         width: player.duration > 0 ? (player.position / player.duration) * parent.width : 0
                         color: progressFill
                         radius: 2
-                        Behavior on width { NumberAnimation { duration: 200 } }
+                        // 拖动预览时关闭 200ms 动画，进度条精确跟手；
+                        // 平时播放进度保留平滑过渡
+                        Behavior on width {
+                            enabled: !seekMouseArea.seeking
+                            NumberAnimation { duration: 200 }
+                        }
                     }
 
                     MouseArea {
@@ -1485,22 +1639,51 @@ ApplicationWindow {
                         anchors.fill: parent
                         cursorShape: Qt.PointingHandCursor
                         property bool seeking: false
+                        property bool dragging: false
+                        property real pressX: 0
+                        property real pendingPos: 0
 
+                        // ===== 拖动逻辑（停止-预览-恢复） =====
+                        // 按下只记录位置，不打断播放；真正开始拖动（位移 >3px）时
+                        // 才停止播放进程（seekDragStarted），拖动过程中只做纯 UI
+                        // 预览（seekPreview，精确跟随鼠标、不触碰进程），松手时
+                        // 在目标位置恢复播放（seekCommit，-ss 精确定位）。
+                        // 旧逻辑每次 mousemove 都杀启一次 ffplay，拖一次进度条
+                        // = 几十次进程重启，是拖动卡顿的主因。
                         onPressed: {
                             if (player.duration > 0) {
                                 seeking = true
-                                var pos = mouseX / width * player.duration
-                                player.seek(pos)
+                                dragging = false
+                                pressX = mouseX
+                                pendingPos = Math.max(0, Math.min(mouseX / width * player.duration, player.duration))
                             }
                         }
                         onPositionChanged: {
-                            if (seeking && player.duration > 0) {
-                                var pos = Math.max(0, Math.min(mouseX / width * player.duration, player.duration))
-                                player.seek(pos)
+                            if (!seeking || player.duration <= 0)
+                                return
+                            pendingPos = Math.max(0, Math.min(mouseX / width * player.duration, player.duration))
+                            if (!dragging && Math.abs(mouseX - pressX) > 3) {
+                                dragging = true
+                                player.seekDragStarted()
                             }
+                            if (dragging)
+                                player.seekPreview(pendingPos)
                         }
                         onReleased: {
+                            if (!seeking)
+                                return
                             seeking = false
+                            if (dragging)
+                                player.seekCommit(pendingPos)
+                            else
+                                player.seek(pendingPos)  // 原地点击：直接跳转
+                        }
+                        onCanceled: {
+                            if (!seeking)
+                                return
+                            seeking = false
+                            if (dragging)
+                                player.seekCommit(pendingPos)
                         }
                     }
                 }
@@ -1995,12 +2178,22 @@ ApplicationWindow {
                     placeholderText: "输入音乐文件夹路径..."
                     color: textPrimary
                     font.pixelSize: 12
+
+                    // 目录无效时的红框提示状态（应用无效路径时短暂点亮）
+                    property bool _invalid: false
+
                     background: Rectangle {
-                                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#1a1a3e" : "#e8e8ec")
-                                            radius: 6
-                                            border.color: darkMode ? "#334466" : "#ccccd0"
-                                        }
-                                    }
+                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#1a1a3e" : "#e8e8ec")
+                        radius: 6
+                        border.color: musicDirInput._invalid ? "#e94560" : (darkMode ? "#334466" : "#ccccd0")
+                    }
+
+                    Timer {
+                        id: musicDirInvalidTimer
+                        interval: 2000
+                        onTriggered: musicDirInput._invalid = false
+                    }
+                }
                     
                                     RowLayout {
                                         Layout.fillWidth: true
@@ -2028,8 +2221,15 @@ ApplicationWindow {
                         text: "应用"
                         font.pixelSize: 12
                         onClicked: {
-                            player.setMusicDir(musicDirInput.text)
-                            saveSetting("musicDir", musicDirInput.text)
+                            // setMusicDir 返回是否成功：只有目录有效才保存到配置，
+                            // 避免无效路径被持久化后每次启动都静默失败
+                            if (player.setMusicDir(musicDirInput.text)) {
+                                saveSetting("musicDir", musicDirInput.text)
+                            } else {
+                                musicDirInput.text = player.musicDir
+                                musicDirInput._invalid = true
+                                musicDirInvalidTimer.restart()
+                            }
                         }
                         background: Rectangle {
                             implicitWidth: 52
@@ -2951,7 +3151,7 @@ ApplicationWindow {
 
                     delegate: Rectangle {
                         width: ListView.view.width
-                        height: 64
+                        height: 72
                         radius: 8
                         color: darkMode ? "#1a2a4e" : "#e8e8ec"
 
@@ -2979,6 +3179,17 @@ ApplicationWindow {
                                     font.pixelSize: 11
                                     elide: Text.ElideRight
                                     Layout.fillWidth: true
+                                }
+
+                                // 歌曲时长（小标题下方）：duration 为 0（接口
+                                // 未返回）时隐藏，不占空间
+                                Text {
+                                    text: modelData.duration > 0 ? player.formatTime(modelData.duration / 1000) : ""
+                                    color: textMuted
+                                    font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                    Layout.fillWidth: true
+                                    visible: text !== ""
                                 }
                             }
 

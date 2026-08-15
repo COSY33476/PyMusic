@@ -445,6 +445,8 @@ class AudioPlayer(QObject):
         self._playlist_visible = True
         self._seek_base = 0.0
         self._volume_dirty = False  # 暂停期间是否有未应用到 ffplay 的音量变更（用于 resume 时补偿）
+        # 进度条拖动开始前是否处于播放中（松手时据此决定恢复播放还是保持暂停）
+        self._seek_drag_was_playing = False
 
         # PulseAudio 探测与 sink-input 查找缓存：
         # - _pa_available：pactl 可用性只探测一次（每次切歌/seek 都同步 spawn
@@ -460,6 +462,8 @@ class AudioPlayer(QObject):
         # 下载面板数据
         self._search_results = []
         self._download_status = ""
+        # 搜索请求代数：连续搜索时旧请求晚到会覆盖新结果，用代数丢弃过期回调
+        self._search_seq = 0
 
         # 内嵌封面异步提取缓存（避免 ffmpeg 阻塞 GUI 线程）
         self._embedded_cover_cache = {}
@@ -527,11 +531,13 @@ class AudioPlayer(QObject):
         """返回当前音乐目录路径（QML 可绑定）"""
         return str(self._music_dir)
 
-    @Slot(str)
+    @Slot(str, result=bool)
     def setMusicDir(self, path):
-        """切换音乐目录并重新扫描歌曲"""
+        """切换音乐目录并重新扫描歌曲，返回是否成功（路径无效返回 False）"""
         path = _to_path(path).expanduser()
-        if path.is_dir() and path != self._music_dir:
+        if not path.is_dir():
+            return False
+        if path != self._music_dir:
             self._music_dir = path
             self._songs = scan_music(path)
             self._sort_songs()
@@ -541,6 +547,7 @@ class AudioPlayer(QObject):
             self.songChanged.emit(-1)
             self.musicDirChanged.emit()
             self._start_metadata_enrichment()
+        return True
 
     # ========== 当前播放索引 ==========
 
@@ -658,10 +665,19 @@ class AudioPlayer(QObject):
             return
         self._download_status = f"正在搜索: {keywords}..."
         self.downloadStatusChanged.emit()
-        self._run_task(lambda: search_songs(keywords), self._on_search_done)
+        # 递增代数：连续搜索 A→B 时，若 A 的结果晚于 B 到达，
+        # _on_search_done 会凭代数丢弃 A 的过期结果，避免列表回退
+        self._search_seq += 1
+        seq = self._search_seq
+        self._run_task(
+            lambda: search_songs(keywords),
+            lambda ok, res: self._on_search_done(seq, ok, res),
+        )
 
-    def _on_search_done(self, ok, result):
+    def _on_search_done(self, seq, ok, result):
         """搜索完成回调（GUI 线程）"""
+        if seq != self._search_seq:
+            return  # 期间发起了新的搜索，丢弃过期结果
         if ok:
             self._search_results = result
             self._download_status = f"找到 {len(result)} 首歌曲"
@@ -750,9 +766,17 @@ class AudioPlayer(QObject):
 
         def worker():
             try:
-                self._task_signals.finished.emit(task_id, True, fn())
+                result = fn()
+                ok = True
             except Exception as e:
-                self._task_signals.finished.emit(task_id, False, e)
+                ok, result = False, e
+            # 应用退出时 AudioPlayer 可能先于线程被销毁，此时 emit 会抛
+            # RuntimeError: Signal source has been deleted（实测可复现）。
+            # 守护线程随进程结束，直接忽略即可，避免退出时刷 traceback。
+            try:
+                self._task_signals.finished.emit(task_id, ok, result)
+            except RuntimeError:
+                pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -825,24 +849,28 @@ class AudioPlayer(QObject):
 
     def _kill_process(self):
         """终止当前 ffplay 进程并清理资源"""
-        if self._process:
+        old_process = self._process
+        if old_process:
             # Disconnect the finished signal to prevent side effects
             try:
-                self._process.finished.disconnect(self._on_ffplay_finished)
-            except:
+                old_process.finished.disconnect(self._on_ffplay_finished)
+            except Exception:
                 pass
-            if self._process.state() == QProcess.Running:
-                pid = self._process.processId()
+            if old_process.state() == QProcess.Running:
+                pid = old_process.processId()
                 if pid > 0:
                     # 先恢复进程（如果被 SIGSTOP 暂停了），确保 SIGTERM 能送达
                     try:
                         os.kill(pid, signal.SIGCONT)
-                    except:
+                    except Exception:
                         pass
-                self._process.terminate()
-                if not self._process.waitForFinished(500):
-                    self._process.kill()
-                    self._process.waitForFinished(300)
+                old_process.terminate()
+                if not old_process.waitForFinished(500):
+                    old_process.kill()
+                    old_process.waitForFinished(300)
+            # QProcess 没有 parent：引用一旦被替换就只有 Python 侧回收，
+            # 显式 deleteLater 让 Qt 事件循环确定性地销毁 C++ 对象
+            old_process.deleteLater()
         self._process = None
         # 进程已死，pid 缓存随之失效
         self._sink_id_cache.clear()
@@ -868,6 +896,11 @@ class AudioPlayer(QObject):
         结果按 pid 缓存（_kill_process 时清空）：同一 ffplay 进程的
         sink-input index 在其生命周期内不变，缓存可避免重试音量纠正时
         反复执行开销不小的 pactl list。
+
+        注意区分两种"找不到"：sink-input 尚未注册（正常，重试即可）和
+        pactl 本身失败（PA 服务挂了）。后者要把 _pa_available 缓存置回
+        None，让下次 _check_pa_available 重新探测，避免 PA 挂掉后所有
+        新歌都按"有 PA"路径启动 100% 音量而音量纠正又永远失败。
         """
         cached = self._sink_id_cache.get(pid)
         if cached is not None:
@@ -877,14 +910,22 @@ class AudioPlayer(QObject):
                 ["pactl", "-f", "json", "list", "sink-inputs"],
                 capture_output=True, text=True, timeout=5
             )
-            inputs = json.loads(result.stdout) if result.stdout.strip() else []
-            for inp in inputs:
-                props = inp.get("properties", {})
-                if props.get("application.process.id") == str(pid):
-                    self._sink_id_cache[pid] = inp["index"]
-                    return inp["index"]
         except Exception:
-            pass
+            self._pa_available = None
+            return None
+        if result.returncode != 0:
+            self._pa_available = None
+            return None
+        try:
+            inputs = json.loads(result.stdout) if result.stdout.strip() else []
+        except ValueError:
+            self._pa_available = None
+            return None
+        for inp in inputs:
+            props = inp.get("properties", {})
+            if props.get("application.process.id") == str(pid):
+                self._sink_id_cache[pid] = inp["index"]
+                return inp["index"]
         return None
 
     def _adjust_volume_pa(self):
@@ -908,12 +949,17 @@ class AudioPlayer(QObject):
         try:
             # PulseAudio 音量范围 0-65536 对应 0%-100%（0dB，无增益）
             pa_vol = int(self._volume / 100.0 * 65536)
-            subprocess.run(
+            result = subprocess.run(
                 ["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
                 capture_output=True, timeout=5
             )
-            return True
+            if result.returncode == 0:
+                return True
+            # 设置失败（PA 服务异常）：使可用性缓存失效，下次重新探测
+            self._pa_available = None
+            return False
         except Exception:
+            self._pa_available = None
             return False
 
     def _retry_pa_volume(self, process_ref, attempt):
@@ -1024,8 +1070,13 @@ class AudioPlayer(QObject):
             self.durationChanged.emit(self._duration)
 
     def _get_current_time(self):
-        """获取当前系统时间戳（用于计算播放进度）"""
-        return time.time()
+        """获取当前时间戳（用于计算播放进度）。
+
+        用 time.monotonic() 而不是 time.time()：播放进度是相对时长计算，
+        系统时钟被 NTP 校准/手动修改时 time.time() 会跳变，导致进度条
+        和暂停时长补偿出现瞬间前跳/回退；monotonic 不受系统时钟影响。
+        """
+        return time.monotonic()
 
     def _get_duration(self, filepath):
         """通过 ffprobe 获取音频文件时长"""
@@ -1038,7 +1089,7 @@ class AudioPlayer(QObject):
             )
             if result.stdout.strip():
                 return float(result.stdout.strip())
-        except:
+        except (OSError, ValueError, subprocess.SubprocessError):
             pass
         return 0.0
 
@@ -1058,12 +1109,16 @@ class AudioPlayer(QObject):
         """ffplay 进程结束时自动切换到下一曲"""
         self._position_timer.stop()
         # 只处理自然退出（我们自己杀进程切歌时已提前断开本信号）
-        if exit_status != QProcess.NormalExit or self._state == "stopped":
+        if self._state == "stopped":
             return
 
-        # 退出码非 0 说明 ffplay 报错退出（文件损坏/解码失败等）。此时若继续
-        # 自动切歌，会在坏文件之间无限循环，直接放弃自动切换。
-        if exit_code != 0:
+        # 退出码非 0 / 非正常退出：ffplay 启动失败（ffplay 不存在）、文件损坏、
+        # 解码失败或被外部杀死。此时若继续自动切歌，会在坏文件之间无限循环；
+        # 之前这里直接 return，UI 会永远停留在"播放中"而实际没有进程在放。
+        # 改为转入 stopped 状态并通知 UI，让播放键回到可重新播放的状态。
+        if exit_status != QProcess.NormalExit or exit_code != 0:
+            self._state = "stopped"
+            self.stateChanged.emit("stopped")
             return
 
         # 时长已知时按播放进度判断是否接近结尾；时长未知（异步 ffprobe 还没
@@ -1077,6 +1132,13 @@ class AudioPlayer(QObject):
             near_end = elapsed >= 1.0
         if near_end:
             self.next()
+            return
+
+        # 正常退出（exit 0）却没到结尾：ffplay 遇到损坏/截断文件会静默正常退出
+        # （实测 exit code 仍为 0），此时若不做处理，UI 会永远停在"播放中"、
+        # 进度条冻结且没有声音。转入 stopped 让播放键恢复可用。
+        self._state = "stopped"
+        self.stateChanged.emit("stopped")
 
     @Slot()
     def play(self):
@@ -1187,6 +1249,7 @@ class AudioPlayer(QObject):
             self._current_index = (self._current_index + delta) % len(self._songs)
         self.songChanged.emit(self._current_index)
         self._position = 0.0
+        self.positionChanged.emit(0.0)  # 立即刷新进度条，不必等下一次 250ms 定时器
         if self._state != "stopped":
             filepath = self._songs[self._current_index]["path"]
             self._start_ffplay(filepath, 0.0)
@@ -1203,6 +1266,8 @@ class AudioPlayer(QObject):
             self._position = max(0.0, min(pos_seconds, self._duration))
         else:
             self._position = max(0.0, pos_seconds)
+        # 立即同步 UI，不必等下一次 250ms 定时器
+        self.positionChanged.emit(self._position)
         self._update_lyric_index()
         if self._state != "stopped":
             filepath = self._songs[self._current_index]["path"]
@@ -1219,6 +1284,52 @@ class AudioPlayer(QObject):
                 # 改由 started 信号触发，避免拖拽进度条时 UI 卡顿。
                 if self._process:
                     self._process.started.connect(self._pause_new_process)
+
+    @Slot()
+    def seekDragStarted(self):
+        """拖动进度条开始：停止播放进程，精确冻结当前位置。
+
+        拖动期间不再按旧逻辑每次 mousemove 杀启一次 ffplay（拖一次
+        进度条 = 几十次进程重启，是拖动卡顿的主因），改为开始拖动时
+        停一次、松手时在目标位置起一次。
+        """
+        self._seek_drag_was_playing = (self._state == "playing")
+        self._position_timer.stop()
+        # 用单调时钟精确结算一次当前位置，此后位置完全由 UI 预览驱动
+        if self._state == "playing":
+            elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
+            pos = self._seek_base + elapsed
+            if self._duration > 0:
+                pos = min(pos, self._duration)
+            self._position = max(0.0, pos)
+            self.positionChanged.emit(self._position)
+        if self._process:
+            self._kill_process()
+        if self._state != "stopped":
+            self._state = "paused"
+            self.stateChanged.emit("paused")
+
+    @Slot(float)
+    def seekPreview(self, pos):
+        """拖动进度条过程中：只精确更新显示位置与歌词索引，不触碰播放进程"""
+        if self._duration > 0:
+            self._position = max(0.0, min(pos, self._duration))
+        else:
+            self._position = max(0.0, pos)
+        self.positionChanged.emit(self._position)
+        self._update_lyric_index()
+
+    @Slot(float)
+    def seekCommit(self, pos):
+        """拖动结束：在目标位置恢复播放（拖动前在播）或保持暂停（拖动前暂停）"""
+        resume_playing = self._seek_drag_was_playing
+        self._seek_drag_was_playing = False
+        if resume_playing and 0 <= self._current_index < len(self._songs):
+            # 先切到"播放中"再走 seek() 的 was_playing 分支：
+            # 重启进程并直接处于播放态，用 -ss 精确定位到松手位置
+            self._state = "playing"
+            self.stateChanged.emit("playing")
+        self.seek(pos)
 
     def _pause_new_process(self):
         """seek/启动即暂停场景：ffplay 启动完成即刻挂起。仅当仍处于暂停态时生效，
@@ -1406,6 +1517,8 @@ class AudioPlayer(QObject):
                 self._current_index = i
                 self.songChanged.emit(i)
                 self._position = float(last_position)
+                # 恢复的位置立刻同步给 UI（此时播放尚未开始，定时器不运行）
+                self.positionChanged.emit(self._position)
                 self._load_lyrics()
                 return True
         return False
@@ -1544,9 +1657,19 @@ class AppBridge(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._quit_callback = None
+        self._tray_available = True
 
     def setQuitCallback(self, callback):
         self._quit_callback = callback
+
+    def setTrayAvailable(self, available):
+        """记录系统托盘是否可用。不可用时 QML 关闭窗口应直接退出，
+        否则窗口藏起来后没有任何入口能恢复（托盘图标不存在）。"""
+        self._tray_available = bool(available)
+
+    @Property(bool, constant=True)
+    def trayAvailable(self):
+        return self._tray_available
 
     @Slot()
     def quitApp(self):
@@ -1599,6 +1722,7 @@ def main():
     # 桥接对象：向 QML 暴露 quitApp()
     bridge = AppBridge()
     bridge.setQuitCallback(quit_app)
+    bridge.setTrayAvailable(QSystemTrayIcon.isSystemTrayAvailable())
     engine.rootContext().setContextProperty("appBridge", bridge)
 
     # 托盘右键菜单：显示主窗口 / 退出

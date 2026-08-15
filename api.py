@@ -156,12 +156,15 @@ def _fetch_cover_data(pic_url):
     max_size = 10 * 1024 * 1024
     chunks = []
     total = 0
-    for chunk in resp.iter_content(chunk_size=65536):
-        total += len(chunk)
-        if total > max_size:
-            resp.close()
-            raise ValueError("cover image too large")
-        chunks.append(chunk)
+    try:
+        for chunk in resp.iter_content(chunk_size=65536):
+            total += len(chunk)
+            if total > max_size:
+                raise ValueError("cover image too large")
+            chunks.append(chunk)
+    finally:
+        # stream=True 下显式关闭响应，及时归还连接池/释放底层 socket
+        resp.close()
     return b"".join(chunks)
 
 
@@ -186,6 +189,8 @@ def search_songs(keywords, limit=10):
             "artist": ", ".join((a or {}).get("name") or "" for a in artists),
             "album": album.get("name") or "",
             "picUrl": album.get("picUrl") or "",
+            # 网易接口返回毫秒；无该字段时给 0，UI 据此隐藏时长
+            "duration": s.get("duration") or 0,
         })
     return formatted
 
