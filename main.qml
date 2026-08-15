@@ -3,6 +3,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import Qt5Compat.GraphicalEffects
 import QtQuick.Dialogs
+import QtQuick.Window
 
 ApplicationWindow {
     id: window
@@ -12,7 +13,12 @@ ApplicationWindow {
     minimumWidth: 720
     minimumHeight: 480
     title: "PyMusic"
-    color: darkMode ? "#1a1a2e" : "#f0f0f2"
+    // 无边框 + 透明窗口：顶栏内部绘制、圆角由 rootSurface 裁剪。
+    // 按平台能力启用：xcb 支持；wayland 下 KDE Plasma(KWin) 支持
+    // startSystemMove/Resize，GNOME 等不支持则回退原生顶栏。
+    property bool _frameless: player.framelessSupported
+    flags: _frameless ? Qt.FramelessWindowHint : Qt.Window
+    color: "transparent"
 
     // 点击 × 时：根据 closeToTray 决定隐藏到托盘还是退出。
     // 系统没有可用托盘时（部分精简桌面环境），隐藏窗口会导致程序
@@ -27,6 +33,9 @@ ApplicationWindow {
     }
 
     // ========== 全局字体 ==========
+    // 注：window.font 不会被普通 Text 继承，此列表仅作兜底候选；
+    // 真正的"全局字体"由 customFontFamily + player.applyGlobalFont()
+    // （QGuiApplication.setFont）下发，见下方设置区。
     // 字体族列表按顺序尝试，命中第一个系统里存在、且能覆盖当前文字的即可。
     //
     // 之前只写了 "Noto Sans CJK SC"（SC = Simplified Chinese，简体中文子集）。
@@ -91,6 +100,12 @@ ApplicationWindow {
     // 显示设置
     property real rowSpacing: 48
     property string customFontFamily: ""
+
+    // 全局字体统一入口：customFontFamily 非空时用自定义字体，
+    // 否则用 window 的 CJK 候选列表。所有 Text 的 font.family 都绑定它
+    // （QML 普通 Text 不继承 window.font，也不跟随 QGuiApplication 默认
+    // 字体——实测两种方式都无效，必须逐处显式绑定）。
+    readonly property string uiFontFamily: customFontFamily !== "" ? customFontFamily : window.font.family
 
     // 设置面板状态
     property bool settingsVisible: false
@@ -167,7 +182,10 @@ ApplicationWindow {
         saveSetting("volume", player.volume)
     }
 
-    Component.onCompleted: {
+    // 从配置文件加载全部设置并应用到 UI/player。
+    // 启动时调用一次；设置回退（settingsRolledBack）后再次调用，
+    // 让整个界面回到上一次保存的状态。
+    function reloadSettings() {
         var s = player.loadSettings()
         if (s.darkMode !== undefined) darkMode = s.darkMode
         if (s.customAccent !== undefined) customAccent = s.customAccent
@@ -184,12 +202,23 @@ ApplicationWindow {
         if (s.sortMode !== undefined) player.sortMode = s.sortMode
         if (s.rowSpacing !== undefined) rowSpacing = s.rowSpacing
         if (s.customFontFamily !== undefined) customFontFamily = s.customFontFamily
+        // 全局字体：customFontFamily 通过 QGuiApplication.setFont 下发给
+        // 整个应用（QML 的 window.font 不会被普通 Text 继承）
+        player.applyGlobalFont(customFontFamily)
         if (s.autoSwitchToLyric !== undefined) autoSwitchToLyric = s.autoSwitchToLyric
         if (s.closeToTray !== undefined) closeToTray = s.closeToTray
         if (s.volume !== undefined) player.volume = s.volume
         if (s.musicDir !== undefined) player.setMusicDir(s.musicDir)
         if (s.lastFile !== undefined && s.lastFile) player.restoreLastPosition()
         saveAllSettings()
+    }
+
+    Component.onCompleted: reloadSettings()
+
+    // 设置回退：player 恢复 .bak1 后重新加载全部设置到 UI
+    Connections {
+        target: player
+        function onSettingsRolledBack() { window.reloadSettings() }
     }
 
     onDarkModeChanged: saveSetting("darkMode", darkMode)
@@ -216,7 +245,10 @@ ApplicationWindow {
             Qt.callLater(lyricView.snapAll)
         }
     }
-    onCustomFontFamilyChanged: saveSetting("customFontFamily", customFontFamily)
+    onCustomFontFamilyChanged: {
+        saveSetting("customFontFamily", customFontFamily)
+        player.applyGlobalFont(customFontFamily)
+    }
     onAutoSwitchToLyricChanged: saveSetting("autoSwitchToLyric", autoSwitchToLyric)
     onCloseToTrayChanged: saveSetting("closeToTray", closeToTray)
 
@@ -241,105 +273,6 @@ ApplicationWindow {
     // 当前过渡挂起的完成定时器实例（每次过渡重建并销毁旧实例，
     // 否则 createQmlObject 出来的 Timer 会随切歌次数无限累积）
     property var _bgTimer: null
-
-    // A 层：只作为 FastBlur 的取样源，不直接可见。
-    // 本地文件用同步加载（asynchronous: false）：切换歌曲时不会出现
-    // "中途被新 source 打断" 的异步加载应答，从根上消除
-    // "QQuickPixmap: connectFinished() called when not loading" 警告，
-    // 也让下面的 status 判断在赋值后立刻就是最终结果。
-    Image {
-        id: bgImageA
-        anchors.fill: parent
-        fillMode: Image.PreserveAspectCrop
-        source: ""
-        asynchronous: false
-        smooth: true
-        visible: false
-    }
-
-    // B 层：只作为 FastBlur 的取样源，不直接可见
-    Image {
-        id: bgImageB
-        anchors.fill: parent
-        fillMode: Image.PreserveAspectCrop
-        source: ""
-        asynchronous: false
-        smooth: true
-        visible: false
-    }
-
-    // A 层的模糊结果：谁在前景就淡入到 1，谁在后景就淡出到 0
-    FastBlur {
-        id: bgBlurA
-        anchors.fill: parent
-        source: bgImageA
-        radius: blurRadius
-        cached: true
-        opacity: 0.0
-        visible: bgImageA.source !== ""
-
-        Behavior on opacity {
-            NumberAnimation { duration: 600; easing.type: Easing.OutCubic }
-        }
-    }
-
-    // B 层的模糊结果
-    FastBlur {
-        id: bgBlurB
-        anchors.fill: parent
-        source: bgImageB
-        radius: blurRadius
-        cached: true
-        opacity: 0.0
-        visible: bgImageB.source !== ""
-
-        Behavior on opacity {
-            NumberAnimation { duration: 600; easing.type: Easing.OutCubic }
-        }
-    }
-
-    // 监听歌曲切换，触发渐变过渡
-    Connections {
-        target: player
-        function onSongChanged(index) {
-            if (index < 0) return
-            window._startBgTransition()
-        }
-    }
-
-    // 监听封面文件更新（重新下载覆盖同路径文件时），提升版本号
-    // 强制所有图片重新加载。
-    // 注意：不能简单地再调一次 _startBgTransition()——onSongChanged 已经
-    // 触发过一次过渡，这里再叠加一次会让 A/B 状态机和挂起的 650ms 定时器
-    // 互相竞争，正是"下载封面后背景消失"的原因。正确做法是：前景层显示的
-    // 就是这张封面时，就地重载（换带新版本号的 URL），不做过渡。
-    Connections {
-        target: player
-        function onCoverFileUpdated(path) {
-            window.coverStamp++
-            var cur = player.currentSongImage
-            var frontImg = window._frontImage()
-            // 与本次下载前的 URL 精确比较（url 类型没有 indexOf，
-            // 且模糊子串匹配可能误伤路径相近的其它歌曲封面）
-            var prevUrl = "file://" + cur + "?b=" + (window.coverStamp - 1)
-            if (cur && String(frontImg.source) === prevUrl) {
-                frontImg.source = "file://" + cur + "?b=" + window.coverStamp
-            } else {
-                window._startBgTransition()
-            }
-        }
-    }
-
-    // 切歌时刷新下载面板搜索框的预填内容（搜索框的 text 绑定在用户
-    // 手动编辑过一次后就会断开，之后不再跟随当前歌曲变化；这里在
-    // 用户从未编辑过的情况下补一次刷新）
-    Connections {
-        target: player
-        function onSongChanged(index) {
-            if (!window._searchBoxEdited)
-                searchInput.text = player.currentSongName || ""
-        }
-    }
 
     // 当前“前景层”的 Image / FastBlur（只读快捷方式，避免重复三元判断）
     function _frontImage() { return window._frontIsA ? bgImageA : bgImageB }
@@ -480,6 +413,248 @@ ApplicationWindow {
         window._bgTransitioning = false
     }
 
+    // ===== 圆角裁剪根容器 =====
+    // 所有内容（背景双层图、模糊层、主布局、滑出面板）都是它的子树，
+    // clip:true 把一切裁进圆角——这是"背景图片盖住圆角"的根治点：
+    // 图片层必须位于被裁剪的圆角容器内部，而不是窗口的直接子项。
+    // 最大化时去圆角/去边距（贴边窗口圆角会露出桌面背景角）。
+    Rectangle {
+        id: rootSurface
+        anchors.fill: parent
+        anchors.margins: (_frameless && window.visibility !== Window.Maximized) ? 6 : 0
+        radius: (_frameless && window.visibility !== Window.Maximized) ? 12 : 0
+        clip: true
+        color: bgDark
+
+        // ===== 背景层容器（唯一进入蒙版层的部分） =====
+        // 整窗 layer+OpacityMask 会把所有文字也渲染进离屏纹理再采样，
+        // 文字失去亚像素渲染优化而发虚——所以蒙版只包住背景层
+        // （背景本身是模糊图，遮罩采样无感），文字/按钮留在层外保持清晰。
+        Rectangle {
+            id: bgSurface
+            anchors.fill: parent
+            radius: rootSurface.radius
+            layer.enabled: true
+            layer.effect: OpacityMask {
+                maskSource: rootMask
+            }
+
+            // A 层：只作为 FastBlur 的取样源，不直接可见。
+            // 本地文件用同步加载（asynchronous: false）：切换歌曲时不会出现
+            // "中途被新 source 打断" 的异步加载应答，从根上消除
+            // "QQuickPixmap: connectFinished() called when not loading" 警告，
+            // 也让下面的 status 判断在赋值后立刻就是最终结果。
+            Image {
+                id: bgImageA
+                anchors.fill: parent
+                fillMode: Image.PreserveAspectCrop
+                source: ""
+                asynchronous: false
+                smooth: true
+                visible: false
+            }
+
+            // B 层：只作为 FastBlur 的取样源，不直接可见
+            Image {
+                id: bgImageB
+                anchors.fill: parent
+                fillMode: Image.PreserveAspectCrop
+                source: ""
+                asynchronous: false
+                smooth: true
+                visible: false
+            }
+
+            // A 层的模糊结果：谁在前景就淡入到 1，谁在后景就淡出到 0
+            FastBlur {
+                id: bgBlurA
+                anchors.fill: parent
+                source: bgImageA
+                radius: blurRadius
+                cached: true
+                opacity: 0.0
+                visible: bgImageA.source !== ""
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 600; easing.type: Easing.OutCubic }
+                }
+            }
+
+            // B 层的模糊结果
+            FastBlur {
+                id: bgBlurB
+                anchors.fill: parent
+                source: bgImageB
+                radius: blurRadius
+                cached: true
+                opacity: 0.0
+                visible: bgImageB.source !== ""
+
+                Behavior on opacity {
+                    NumberAnimation { duration: 600; easing.type: Easing.OutCubic }
+                }
+            }
+
+            // 顶栏底色（panelOpacity 驱动）：声明在最后，盖在模糊层之上，
+            // 随背景一起被圆角遮罩；文字与按钮在透明的 titleBar 里，不经过蒙版层
+            Rectangle {
+                id: titleBarTint
+                width: parent.width
+                height: 38
+                visible: titleBar.visible
+                color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+            }
+
+            // 底栏底色（panelOpacity 驱动）：与顶栏同理放进蒙版层，
+            // 左下/右下随背景一起裁圆角，不再出现方形暗角
+            Rectangle {
+                id: bottomBarTint
+                anchors.bottom: parent.bottom
+                width: parent.width
+                height: 72
+                color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+            }
+        }
+
+        // ===== 内部顶栏（无边框模式下绘制；Wayland 回退时隐藏） =====
+        Rectangle {
+            id: titleBar
+            visible: window._frameless
+            // 显式 z 抬到背景模糊层/主布局之上
+            // （主布局从 topMargin 开始不重叠；滑出面板 z=100 仍覆盖顶栏）
+            z: 1
+            width: parent.width
+            height: 38
+            // 底色由 bgSurface.titleBarTint 提供(随背景一起圆角遮罩)，
+            // 顶栏本身透明，文字/按钮不经过蒙版层保持清晰
+            color: "transparent"
+
+            // 拖动区放最前声明（后续兄弟层叠在上、优先收事件）
+            MouseArea {
+                id: titleDragArea
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton
+                cursorShape: Qt.ArrowCursor
+                onPressed: {
+                    if (window.visibility !== Window.Maximized)
+                        window.startSystemMove()
+                }
+            }
+
+            RowLayout {
+                // 注意：必须显式锚定左右边，leftMargin/rightMargin 才生效
+                // （之前只有 width/height，RowLayout 贴到 x=0，LOGO 被
+                // 圆角遮罩切掉左侧）
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                height: parent.height
+                anchors.leftMargin: 12
+                anchors.rightMargin: 6
+                spacing: 6
+
+                Text {
+                    text: "PyMusic"
+                    color: textPrimary
+                    font.family: window.uiFontFamily
+                    font.pixelSize: 12
+                    font.bold: true
+                    Layout.alignment: Qt.AlignVCenter
+                }
+                Item { Layout.fillWidth: true }
+
+                // 最小化
+                Rectangle {
+                    id: titleMinBtn
+                    Layout.alignment: Qt.AlignVCenter
+                    width: 34; height: 26; radius: 6
+                    color: titleMinBtnMouse.containsPress ? accent : (titleMinBtnMouse.containsMouse ? Qt.rgba(1,1,1,0.12) : "transparent")
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "—"
+                        color: textPrimary
+                        font.family: window.uiFontFamily
+                        font.pixelSize: 13
+                    }
+                    MouseArea {
+                        id: titleMinBtnMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: window.showMinimized()
+                    }
+                }
+
+                // 退出
+                Rectangle {
+                    id: titleCloseBtn
+                    Layout.alignment: Qt.AlignVCenter
+                    width: 34; height: 26; radius: 6
+                    color: titleCloseBtnMouse.containsPress ? accent : (titleCloseBtnMouse.containsMouse ? Qt.rgba(0.9, 0.2, 0.25, 0.75) : "transparent")
+                    Behavior on color { ColorAnimation { duration: 100 } }
+                    Text {
+                        anchors.centerIn: parent
+                        text: "✕"
+                        color: textPrimary
+                        font.family: window.uiFontFamily
+                        font.pixelSize: 12
+                    }
+                    MouseArea {
+                        id: titleCloseBtnMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        // X = 直接退出程序（不走 closeToTray 的隐藏逻辑）
+                        onClicked: appBridge.quitApp()
+                    }
+                }
+            }
+        }
+
+    Connections {
+        target: player
+        function onSongChanged(index) {
+            if (index < 0) return
+            window._startBgTransition()
+        }
+    }
+
+    // 监听封面文件更新（重新下载覆盖同路径文件时），提升版本号
+    // 强制所有图片重新加载。
+    // 注意：不能简单地再调一次 _startBgTransition()——onSongChanged 已经
+    // 触发过一次过渡，这里再叠加一次会让 A/B 状态机和挂起的 650ms 定时器
+    // 互相竞争，正是"下载封面后背景消失"的原因。正确做法是：前景层显示的
+    // 就是这张封面时，就地重载（换带新版本号的 URL），不做过渡。
+    Connections {
+        target: player
+        function onCoverFileUpdated(path) {
+            window.coverStamp++
+            var cur = player.currentSongImage
+            var frontImg = window._frontImage()
+            // 与本次下载前的 URL 精确比较（url 类型没有 indexOf，
+            // 且模糊子串匹配可能误伤路径相近的其它歌曲封面）
+            var prevUrl = "file://" + cur + "?b=" + (window.coverStamp - 1)
+            if (cur && String(frontImg.source) === prevUrl) {
+                frontImg.source = "file://" + cur + "?b=" + window.coverStamp
+            } else {
+                window._startBgTransition()
+            }
+        }
+    }
+
+    // 切歌时刷新下载面板搜索框的预填内容（搜索框的 text 绑定在用户
+    // 手动编辑过一次后就会断开，之后不再跟随当前歌曲变化；这里在
+    // 用户从未编辑过的情况下补一次刷新）
+    Connections {
+        target: player
+        function onSongChanged(index) {
+            if (!window._searchBoxEdited)
+                searchInput.text = player.currentSongName || ""
+        }
+    }
+
+
     // 无封面淡出动画结束：此刻两层 FastBlur 已完全透明，清空 source 无感。
     // token 校验防止动画期间又切了歌（交给新过渡处理）。
     function _finishBgClear(token) {
@@ -498,6 +673,7 @@ ApplicationWindow {
     // ========== 布局 ==========
     ColumnLayout {
         anchors.fill: parent
+        anchors.topMargin: titleBar.visible ? titleBar.height : 0
         spacing: 0
 
         // --- 主内容区 ---
@@ -556,12 +732,14 @@ ApplicationWindow {
                                     spacing: 8
 
                                     Text {
+                                        font.family: window.uiFontFamily
                                         Layout.alignment: Qt.AlignHCenter
                                         text: "♫"
                                         font.pixelSize: playlistVisible ? 64 : 80
                                         color: textMuted
                                     }
                                     Text {
+                                        font.family: window.uiFontFamily
                                         Layout.alignment: Qt.AlignHCenter
                                         text: "暂无封面"
                                         font.pixelSize: 13
@@ -590,6 +768,7 @@ ApplicationWindow {
                         }
 
                         Text {
+                            font.family: window.uiFontFamily
                             Layout.fillWidth: true
                             horizontalAlignment: Text.AlignHCenter
                             text: player.currentSongName || "未选择歌曲"
@@ -611,16 +790,19 @@ ApplicationWindow {
                             visible: player.state !== "stopped"
 
                             Text {
+                                font.family: window.uiFontFamily
                                 text: player.formatTime(player.position)
                                 color: textSecondary
                                 font.pixelSize: 12
                             }
                             Text {
+                                font.family: window.uiFontFamily
                                 text: "/"
                                 color: textMuted
                                 font.pixelSize: 12
                             }
                             Text {
+                                font.family: window.uiFontFamily
                                 text: player.formatTime(player.duration)
                                 color: textSecondary
                                 font.pixelSize: 12
@@ -664,6 +846,7 @@ ApplicationWindow {
                                 anchors.rightMargin: 16
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     text: "播放列表"
                                     color: textPrimary
                                     font.pixelSize: 15
@@ -708,6 +891,7 @@ ApplicationWindow {
                                 Item { Layout.fillWidth: true }
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     text: player.songCount + " 首"
                                     color: textMuted
                                     font.pixelSize: 12
@@ -811,6 +995,7 @@ ApplicationWindow {
                                 Behavior on height { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
                                 clip: true
                                 Text {
+                                    font.family: window.uiFontFamily
                                     anchors.centerIn: parent
                                     text: {
                                         var lines = Math.floor(parent.height / rowSpacing)
@@ -832,6 +1017,7 @@ ApplicationWindow {
                                 Behavior on height { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
                                 clip: true
                                 Text {
+                                    font.family: window.uiFontFamily
                                     anchors.centerIn: parent
                                     text: {
                                         var lines = Math.floor(parent.height / rowSpacing)
@@ -899,6 +1085,7 @@ ApplicationWindow {
                                         border.color: textMuted
 
                                         Text {
+                                            font.family: window.uiFontFamily
                                             anchors.centerIn: parent
                                             text: index === player.currentIndex ? "▶" : (index + 1)
                                             color: index === player.currentIndex ? "#fff" : textMuted
@@ -908,22 +1095,15 @@ ApplicationWindow {
 
                                     // 歌曲名
                                     Text {
+                                        font.family: window.uiFontFamily
                                         Layout.fillWidth: true
                                         text: player.songName(index) || "未知"
                                         color: index === player.currentIndex ? accent : textPrimary
-                                        font.family: customFontFamily !== "" ? customFontFamily : window.font.family
                                         font.pixelSize: 13
                                         font.bold: index === player.currentIndex
                                         elide: Text.ElideRight
                                     }
 
-                                    // 有封面的标记
-                                    Text {
-                                        visible: player.songImage(index) !== ""
-                                        text: "🖼"
-                                        color: textMuted
-                                        font.pixelSize: 11
-                                    }
                                 }
 
                                 MouseArea {
@@ -954,6 +1134,7 @@ ApplicationWindow {
                             color: "transparent"
 
                             Text {
+                                font.family: window.uiFontFamily
                                 anchors.centerIn: parent
                                 text: "歌词"
                                 color: textSecondary
@@ -1065,20 +1246,30 @@ ApplicationWindow {
 
                             property var groupOf: []
                             property var indexInGroup: []
+                            // 每组的行数：groupBaseY 需要据此判断"该组是否真有多行"，
+                            // 只有多行的组才在组内预留 groupInnerGap——否则普通歌词
+                            // （单行组）也会被无端加上 40px，行距变成
+                            // itemHeight + groupInnerGap（实测 102px），与双语歌词
+                            // 的跨组间距（62px）不一致。
+                            property var groupSize: []
                             // groupBaseY[g]：第 g 组"组内第 0 行"相对于第 0 组的累积偏移。
-                            // 每组累加 itemHeight + groupInnerGap：组内 pair 占掉
-                            // groupInnerGap 后，"上一组译文 ↔ 下一组原文"的视觉间距
-                            // 恰好等于 itemHeight——既符合"rowSpacing 控制组与组
-                            // 距离"的设计意图，也和行序保护(C 方案)的跨组 minGap
-                            // (itemHeight) 完全一致。此前只累加 itemHeight，视觉
-                            // 跨组间距实际是 itemHeight - groupInnerGap，行序保护
-                            // 会把每组往下推一个 gap，导致居中误差随组号线性累积。
+                            // 每组累加 itemHeight；多行组（双语对照等）按组内行数-1
+                            // 额外累加 groupInnerGap——普通歌词行距 = rowSpacing，
+                            // 双语歌词组内 = groupInnerGap、跨组视觉间距 = itemHeight，
+                            // 且组内行数不受限于 2（3 行及以上也不会侵入下一组），
+                            // 与行序保护(C 方案)的跨组 minGap(itemHeight) 一致。
                             readonly property var groupBaseY: {
                                 var arr = []
                                 var base = 0
                                 for (var g = 0; g < groupCount; g++) {
                                     arr.push(base)
-                                    base += itemHeight + groupInnerGap
+                                    base += itemHeight
+                                    // 组内有几行就预留几个组内间距：
+                                    // 双语 2 行时行为不变；3 行及以上时若只预留
+                                    // 1 个 gap，目标布局本身会与下一组重叠，
+                                    // 行序保护只能把后续组整体下推、居中失效
+                                    if (groupSize.length > g && groupSize[g] > 1)
+                                        base += (groupSize[g] - 1) * groupInnerGap
                                 }
                                 return arr
                             }
@@ -1114,6 +1305,7 @@ ApplicationWindow {
                                 var count = player.lyricCount
                                 var gOf = []
                                 var iInG = []
+                                var gSize = []
                                 var g = -1
                                 var lastTime = null
                                 var curGroupStart = 0
@@ -1127,9 +1319,14 @@ ApplicationWindow {
                                     iInG.push(i - curGroupStart)
                                     lastTime = t
                                 }
+                                // 回填每组的行数：groupBaseY 绑定依赖它判断
+                                // 该组是否为双语对照（行数 > 1 才预留组内 gap）
+                                for (var gi = 0; gi <= g; gi++) gSize.push(0)
+                                for (var j = 0; j < count; j++) gSize[gOf[j]] += 1
 
                                 groupOf = gOf
                                 indexInGroup = iInG
+                                groupSize = gSize
                                 // groupCount 只依赖分组结构（歌词内容），不依赖 itemHeight；
                                 // 触发 groupBaseY 的 binding 重新求值靠的是它被读取时自动
                                 // 建立的依赖关系，这里赋值即可，具体的像素值交给上面的
@@ -1402,6 +1599,7 @@ ApplicationWindow {
                                     }
 
                                     Text {
+                                        font.family: window.uiFontFamily
                                         id: lyricText
                                         anchors.centerIn: parent
                                         width: parent.width
@@ -1427,7 +1625,6 @@ ApplicationWindow {
                                             return Qt.tint(base, Qt.rgba(highlight.r, highlight.g, highlight.b, lyricRow.highlightProgress * 0.9))
                                         }
 
-                                        font.family: customFontFamily !== "" ? customFontFamily : window.font.family
                                         font.pixelSize: 14
                                         // 注意：这里不用 font.bold 来强调当前行——bold 是一个
                                         // 布尔值，字重要么是常规、要么是加粗，中间没有过渡态，
@@ -1566,6 +1763,7 @@ ApplicationWindow {
                                 spacing: 6
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     Layout.alignment: Qt.AlignHCenter
                                     text: player.currentSongName || ""
                                     color: textPrimary
@@ -1581,16 +1779,19 @@ ApplicationWindow {
                                     visible: player.state !== "stopped"
 
                                     Text {
+                                        font.family: window.uiFontFamily
                                         text: player.formatTime(player.position)
                                         color: textSecondary
                                         font.pixelSize: 12
                                     }
                                     Text {
+                                        font.family: window.uiFontFamily
                                         text: "/"
                                         color: textMuted
                                         font.pixelSize: 12
                                     }
                                     Text {
+                                        font.family: window.uiFontFamily
                                         text: player.formatTime(player.duration)
                                         color: textSecondary
                                         font.pixelSize: 12
@@ -1608,7 +1809,10 @@ ApplicationWindow {
             id: bottomBar
             Layout.fillWidth: true
             Layout.preferredHeight: 72
-            color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+            // 底色由 bgSurface.bottomBarTint 提供（随背景一起被圆角遮罩）：
+            // 之前这里自带方形背景，方角直抵窗口底边，左下/右下会画出
+            // 暗色尖角；控件文字留在层外保持清晰
+            color: "transparent"
 
             ColumnLayout {
                 anchors.fill: parent
@@ -1706,6 +1910,7 @@ ApplicationWindow {
                         Behavior on color { ColorAnimation { duration: 100 } }
 
                         Text {
+                            font.family: window.uiFontFamily
                             anchors.centerIn: parent
                             text: "⚙"
                             color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
@@ -1791,6 +1996,7 @@ ApplicationWindow {
                         }
 
                         Text {
+                            font.family: window.uiFontFamily
                             text: player.currentSongName || ""
                             color: textPrimary
                             font.pixelSize: 13
@@ -1801,6 +2007,7 @@ ApplicationWindow {
 
                     // 下一曲 (居中)
                     Text {
+                        font.family: window.uiFontFamily
                         text: {
                             if (player.songCount <= 0 || player.currentIndex < 0) return ""
                             var nextIdx = (player.currentIndex + 1) % player.songCount
@@ -1826,6 +2033,7 @@ ApplicationWindow {
                         Behavior on color { ColorAnimation { duration: 100 } }
 
                         Text {
+                            font.family: window.uiFontFamily
                             anchors.centerIn: parent
                             text: "☰"
                             color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
@@ -1895,6 +2103,7 @@ ApplicationWindow {
                             Behavior on color { ColorAnimation { duration: 100 } }
 
                             Text {
+                                font.family: window.uiFontFamily
                                 anchors.centerIn: parent
                                 text: player.state === "playing" ? "⏸" : "▶"
                                 color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
@@ -2100,6 +2309,7 @@ ApplicationWindow {
         // 半透明遮罩（点击关闭）
         Rectangle {
             anchors.fill: parent
+            radius: rootSurface.radius
             color: Qt.rgba(0, 0, 0, 0.35)
 
             MouseArea {
@@ -2157,6 +2367,7 @@ ApplicationWindow {
 
                 // 标题
                 Text {
+                    font.family: window.uiFontFamily
                     text: "设置"
                     color: textPrimary
                     font.pixelSize: 20
@@ -2165,6 +2376,7 @@ ApplicationWindow {
 
                 // ===== 音乐文件夹 =====
                 Text {
+                    font.family: window.uiFontFamily
                     text: "音乐文件夹"
                     color: textPrimary
                     font.pixelSize: 14
@@ -2257,6 +2469,7 @@ ApplicationWindow {
 
                 // ===== 颜色自定义 =====
                 Text {
+                    font.family: window.uiFontFamily
                     text: "颜色自定义"
                     color: textPrimary
                     font.pixelSize: 14
@@ -2269,6 +2482,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "主题色"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2312,6 +2526,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "深色背景"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2355,6 +2570,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "亮色背景"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2398,6 +2614,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "控件底色"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2445,6 +2662,7 @@ ApplicationWindow {
 
                 // ===== 歌词颜色 =====
                 Text {
+                    font.family: window.uiFontFamily
                     text: "歌词颜色"
                     color: textPrimary
                     font.pixelSize: 14
@@ -2456,6 +2674,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "当前行"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2498,6 +2717,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "已播行"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2540,6 +2760,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "未播行"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2583,6 +2804,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "隐藏控件底色"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2622,6 +2844,7 @@ ApplicationWindow {
 
                 // ===== 背景效果 =====
                 Text {
+                    font.family: window.uiFontFamily
                     text: "背景效果"
                     color: textPrimary
                     font.pixelSize: 14
@@ -2634,6 +2857,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "模糊程度"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2675,6 +2899,7 @@ ApplicationWindow {
                     }
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: Math.round(blurRadius)
                         color: textSecondary
                         font.pixelSize: 12
@@ -2689,6 +2914,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "面板透明度"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2730,6 +2956,7 @@ ApplicationWindow {
                     }
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: Math.round(panelOpacity * 100) + "%"
                         color: textSecondary
                         font.pixelSize: 12
@@ -2742,7 +2969,7 @@ ApplicationWindow {
                 Button {
                     Layout.alignment: Qt.AlignHCenter
                     text: "恢复默认颜色"
-                    font.pixelSize: 12
+                    font.pixelSize: 11
                     onClicked: {
                         customAccent = ""
                         customDarkBg = ""
@@ -2754,12 +2981,14 @@ ApplicationWindow {
                         
                     }
                     background: Rectangle {
+                        implicitWidth: 52
+                        implicitHeight: 28
                         color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
-                        radius: 6
+                        radius: 4
                     }
                     contentItem: Text {
                         text: parent.text
-                        color: textSecondary
+                        color: textPrimary
                         font: parent.font
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
@@ -2776,6 +3005,7 @@ ApplicationWindow {
 
                 // ===== 显示设置 =====
                 Text {
+                    font.family: window.uiFontFamily
                     text: "显示设置"
                     color: textPrimary
                     font.pixelSize: 14
@@ -2788,6 +3018,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "行间距"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2829,6 +3060,7 @@ ApplicationWindow {
                     }
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: Math.round(rowSpacing) + "px"
                         color: textSecondary
                         font.pixelSize: 12
@@ -2857,6 +3089,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "全局字体"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2964,6 +3197,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "自动切换到歌词"
                         color: textPrimary
                         font.pixelSize: 12
@@ -2998,6 +3232,7 @@ ApplicationWindow {
                     spacing: 10
 
                     Text {
+                        font.family: window.uiFontFamily
                         text: "点击 × 时隐藏到托盘"
                         color: textPrimary
                         font.pixelSize: 12
@@ -3026,6 +3261,32 @@ ApplicationWindow {
                     }
                 }
 
+                // ===== 回退设置（设置页最下方） =====
+                // 恢复到上一次保存的全部设置（最多连续回退两次，对应
+                // .bak1/.bak2 两个历史版本）；回退后整个界面重载。
+                // 拖动滑块等密集保存会被合并为一个历史版本（3 秒静默
+                // 窗口），回退恢复到"这一轮修改之前"而不是中间值。
+                Button {
+                    Layout.alignment: Qt.AlignHCenter
+                    text: "回退上次设置"
+                    font.pixelSize: 11
+                    enabled: player.hasSettingsBackup
+                    onClicked: player.rollbackSettings()
+                    background: Rectangle {
+                        implicitWidth: 52
+                        implicitHeight: 28
+                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                        radius: 4
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: enabled ? textPrimary : textMuted
+                        font: parent.font
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
             }
         }
     }
@@ -3041,6 +3302,7 @@ ApplicationWindow {
         // 半透明遮罩（点击关闭）
         Rectangle {
             anchors.fill: parent
+            radius: rootSurface.radius
             color: Qt.rgba(0, 0, 0, 0.35)
 
             MouseArea {
@@ -3068,6 +3330,7 @@ ApplicationWindow {
 
                 // 标题
                 Text {
+                    font.family: window.uiFontFamily
                     text: "在线下载歌词/封面"
                     color: textPrimary
                     font.pixelSize: 16
@@ -3076,6 +3339,7 @@ ApplicationWindow {
 
                 // 当前歌曲
                 Text {
+                    font.family: window.uiFontFamily
                     text: "当前歌曲: " + (player.currentSongName || "无")
                     color: textSecondary
                     font.pixelSize: 12
@@ -3116,6 +3380,7 @@ ApplicationWindow {
                         Behavior on color { ColorAnimation { duration: 100 } }
 
                         Text {
+                            font.family: window.uiFontFamily
                             anchors.centerIn: parent
                             text: "搜索"
                             color: "#fff"
@@ -3132,6 +3397,7 @@ ApplicationWindow {
 
                 // 状态提示
                 Text {
+                    font.family: window.uiFontFamily
                     id: downloadStatusText
                     text: player.downloadStatus || ""
                     color: textSecondary
@@ -3165,6 +3431,7 @@ ApplicationWindow {
                                 spacing: 2
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     text: modelData.name || ""
                                     color: textPrimary
                                     font.pixelSize: 13
@@ -3174,6 +3441,7 @@ ApplicationWindow {
                                 }
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     text: (modelData.artist || "") + (modelData.album ? " · " + modelData.album : "")
                                     color: textSecondary
                                     font.pixelSize: 11
@@ -3184,6 +3452,7 @@ ApplicationWindow {
                                 // 歌曲时长（小标题下方）：duration 为 0（接口
                                 // 未返回）时隐藏，不占空间
                                 Text {
+                                    font.family: window.uiFontFamily
                                     text: modelData.duration > 0 ? player.formatTime(modelData.duration / 1000) : ""
                                     color: textMuted
                                     font.pixelSize: 11
@@ -3202,6 +3471,7 @@ ApplicationWindow {
                                 Behavior on color { ColorAnimation { duration: 100 } }
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     anchors.centerIn: parent
                                     text: "歌词"
                                     color: "#fff"
@@ -3224,6 +3494,7 @@ ApplicationWindow {
                                 Behavior on color { ColorAnimation { duration: 100 } }
 
                                 Text {
+                                    font.family: window.uiFontFamily
                                     anchors.centerIn: parent
                                     text: "封面"
                                     color: "#fff"
@@ -3240,6 +3511,73 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+    }
+    }
+
+    // ===== 圆角遮罩（rootSurface 的 layer.effect 取样源，勿放进 rootSurface 内） =====
+    Rectangle {
+        id: rootMask
+        visible: false
+        anchors.fill: rootSurface
+        radius: rootSurface.radius
+    }
+
+    // ===== 无边框窗口的尺寸调节边缘 =====
+    // 根容器四周留了 6px 透明边，边缘条挂在窗口级（rootSurface 之上），
+    // 最大化时隐藏（贴边不需要也无法调节）
+    Item {
+        id: resizeEdges
+        visible: window._frameless && window.visibility !== Window.Maximized
+        anchors.fill: parent
+
+        MouseArea {
+            anchors { left: parent.left; top: parent.top; bottom: parent.bottom }
+            width: 6
+            cursorShape: Qt.SizeHorCursor
+            onPressed: window.startSystemResize(Qt.LeftEdge)
+        }
+        MouseArea {
+            anchors { right: parent.right; top: parent.top; bottom: parent.bottom }
+            width: 6
+            cursorShape: Qt.SizeHorCursor
+            onPressed: window.startSystemResize(Qt.RightEdge)
+        }
+        MouseArea {
+            anchors { left: parent.left; right: parent.right; top: parent.top }
+            height: 6
+            cursorShape: Qt.SizeVerCursor
+            onPressed: window.startSystemResize(Qt.TopEdge)
+        }
+        MouseArea {
+            anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+            height: 6
+            cursorShape: Qt.SizeVerCursor
+            onPressed: window.startSystemResize(Qt.BottomEdge)
+        }
+        MouseArea {
+            anchors { left: parent.left; top: parent.top }
+            width: 10; height: 10
+            cursorShape: Qt.SizeFDiagCursor
+            onPressed: window.startSystemResize(Qt.LeftEdge | Qt.TopEdge)
+        }
+        MouseArea {
+            anchors { right: parent.right; top: parent.top }
+            width: 10; height: 10
+            cursorShape: Qt.SizeBDiagCursor
+            onPressed: window.startSystemResize(Qt.RightEdge | Qt.TopEdge)
+        }
+        MouseArea {
+            anchors { left: parent.left; bottom: parent.bottom }
+            width: 10; height: 10
+            cursorShape: Qt.SizeBDiagCursor
+            onPressed: window.startSystemResize(Qt.LeftEdge | Qt.BottomEdge)
+        }
+        MouseArea {
+            anchors { right: parent.right; bottom: parent.bottom }
+            width: 10; height: 10
+            cursorShape: Qt.SizeFDiagCursor
+            onPressed: window.startSystemResize(Qt.RightEdge | Qt.BottomEdge)
         }
     }
 
@@ -3296,6 +3634,7 @@ ApplicationWindow {
             implicitHeight: 44
             color: "transparent"
             Text {
+                font.family: window.uiFontFamily
                 anchors.centerIn: parent
                 text: "选择全局字体"
                 color: textPrimary

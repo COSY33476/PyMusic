@@ -13,6 +13,14 @@ _NETEASE_HEADERS = {
 }
 
 
+class NeteaseAPIError(Exception):
+    """网易接口不可用（网络异常/被风控/接口变更）。
+
+    与"正常返回但没有结果"区分开：前者向用户展示明确失败提示，
+    而不是静默显示"找到 0 首歌曲"让用户误以为程序坏了。
+    """
+
+
 # ========== 底层 API 函数 ==========
 
 
@@ -24,13 +32,14 @@ def search_netease(keywords, limit=10):
         resp = requests.post(url, headers=_NETEASE_HEADERS, timeout=10)
         data = resp.json()
     except (requests.RequestException, ValueError):
-        # 网络错误或接口被风控返回非 JSON（HTML）时，静默返回空列表
-        return []
-    if data.get("code") == 200:
-        # 注意 .get(key, default) 不防值为 null：result 为 null 时
-        # 需要 or {} 兜底，否则 None.get("songs") 会抛 AttributeError
-        return (data.get("result") or {}).get("songs") or []
-    return []
+        # 网络错误或接口被风控返回非 JSON（HTML）时抛明确异常，
+        # 由上层展示"搜索失败"而不是静默空列表
+        raise NeteaseAPIError("网络异常或接口被限制") from None
+    if data.get("code") != 200:
+        raise NeteaseAPIError("网络异常或接口被限制")
+    # 注意 .get(key, default) 不防值为 null：result 为 null 时
+    # 需要 or {} 兜底，否则 None.get("songs") 会抛 AttributeError
+    return (data.get("result") or {}).get("songs") or []
 
 
 def _parse_lrc(lrc_text):
@@ -114,6 +123,11 @@ def _merge_bilingual_lyric(lrc_text, tlyric_text):
 
 def get_netease_lyric(song_id):
     """获取歌词文本，有翻译时自动合并为双语 LRC"""
+    # 无效/负 id（如 32 位截断的溢出值）直接返回 None：
+    # 网易对未知 id 不报错，而是返回 "[00:00.00]暂无歌词" 占位文本，
+    # 不能让它被当作真实歌词
+    if not song_id or song_id <= 0:
+        return None
     url = f"https://music.163.com/api/song/lyric?os=osx&id={song_id}&lv=-1&kv=-1&tv=-1"
     try:
         resp = requests.get(url, headers=_NETEASE_HEADERS, timeout=10)
@@ -132,6 +146,8 @@ def get_netease_lyric(song_id):
 
 def get_netease_detail(song_id):
     """获取歌曲详情，返回封面 URL"""
+    if not song_id or song_id <= 0:
+        return None
     encoded_id = urllib.parse.quote(f"[{song_id}]")
     url = f"https://music.163.com/api/song/detail/?id={song_id}&ids={encoded_id}&csrf_token="
     try:
@@ -195,13 +211,44 @@ def search_songs(keywords, limit=10):
     return formatted
 
 
+def _rotate_backup(path):
+    """回退保护：把现有文件轮换进 <文件名>.bak1 / <文件名>.bak2，
+    最多保留两个旧版本（bak1=上一次，bak2=再上一次），
+    供误下载/误覆盖后改名恢复。"""
+    if not path.is_file():
+        return
+    bak1 = path.with_name(path.name + ".bak1")
+    bak2 = path.with_name(path.name + ".bak2")
+    try:
+        if bak2.is_file():
+            bak2.unlink()
+    except OSError:
+        return
+    try:
+        if bak1.is_file():
+            bak1.rename(bak2)
+    except OSError:
+        return
+    try:
+        path.rename(bak1)
+    except OSError:
+        pass
+
+
 def save_lyric_file(song_id, save_path):
     """下载歌词并保存到文件，返回保存路径，失败返回 None"""
     lyric_text = get_netease_lyric(song_id)
     if not lyric_text:
         return None
+    # 兜底：网易对无效 id 返回 "[00:00.00]暂无歌词" 占位文本，
+    # 不能把占位内容存成 .lrc 文件
+    lines = [l for l in lyric_text.split("\n") if l.strip()]
+    if len(lines) == 1 and "暂无歌词" in lines[0]:
+        return None
     save_path = Path(save_path)
     lrc_path = save_path.with_suffix(".lrc")
+    # 回退保护：已有歌词先备份为 .lrc.bak，防止误下载覆盖无法恢复
+    _rotate_backup(lrc_path)
     lrc_path.write_text(lyric_text, encoding="utf-8")
     return str(lrc_path)
 
@@ -226,15 +273,14 @@ def save_cover_file(song_id, pic_url, save_path):
     else:
         ext = ".jpg"
     cover_path = save_path.with_suffix(ext)
-    # 先写新文件，再清理同名的旧封面（扩展名可能不同，如旧 .jpg 新 .png）：
-    # 否则重扫目录时旧文件会按扩展名顺序优先被 find_matching_image 命中，
-    # 表现为"封面没更新"。写入失败时不动旧文件。
-    cover_path.write_bytes(img_data)
+    # 回退保护：旧封面（含其它扩展名）改名 .bak 而不是删除，
+    # 误下载后可以改名恢复；同时避免重扫目录时旧文件按扩展名
+    # 顺序优先被 find_matching_image 命中导致"封面没更新"。
+    # 先备份再写：写入失败时旧封面仍在 .bak 里可恢复。
     for old_ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
         old_path = save_path.with_suffix(old_ext)
         if old_path != cover_path and old_path.is_file():
-            try:
-                old_path.unlink()
-            except OSError:
-                pass
+            _rotate_backup(old_path)
+    _rotate_backup(cover_path)
+    cover_path.write_bytes(img_data)
     return str(cover_path)

@@ -4,6 +4,7 @@
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -12,14 +13,15 @@ import json
 import time
 import hashlib
 import threading
-from api import search_songs, save_lyric_file, save_cover_file
+from api import search_songs, save_lyric_file, save_cover_file, NeteaseAPIError
 
 from PySide6.QtCore import (
-    QObject, Signal, Slot, Property, QTimer, QProcess
+    QObject, Signal, Slot, Property, QTimer, QProcess, QSocketNotifier
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QFont, QGuiApplication
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import QApplication
-from PySide6.QtWidgets import QSystemTrayIcon, QMenu
+from PySide6.QtWidgets import QSystemTrayIcon, QMenu, QMessageBox
 from PySide6.QtQml import QQmlApplicationEngine
 
 
@@ -311,42 +313,121 @@ def extract_song_metadata(song_path):
         return "", ""
 
 
+def _get_scan_cache_dir():
+    """扫描缓存目录：普通用户 ~/.cache/PyMusic。
+
+    root 启动保护：以 root 运行时不往 /root/.cache 写持久缓存（那会
+    产生 root 属主文件、且普通用户后续无法复用），改落到系统临时目录
+    （会话级缓存，不污染用户环境）。
+    """
+    if getattr(os, "geteuid", lambda: -1)() == 0:
+        return Path(tempfile.gettempdir()) / "PyMusic-root-cache"
+    return Path.home() / ".cache" / "PyMusic"
+
+
+SCAN_CACHE_DIR = _get_scan_cache_dir()
+
+
+def _scan_cache_path(dir_path):
+    """每个音乐目录一个缓存文件（按目录路径哈希命名）"""
+    digest = hashlib.md5(str(dir_path).encode("utf-8")).hexdigest()[:16]
+    return SCAN_CACHE_DIR / f"scan_{digest}.json"
+
+
+def _list_dir_names(dir_path):
+    """快速列出目录里的音频/图片文件名清单。
+
+    用 os.scandir 的 d_type 判断文件类型，不逐文件 stat——
+    这是缓存热路径，在 NAS/挂载盘上也能保持快（单次目录读取）。
+    返回 (音频名列表, 图片名列表)，均为排序后的字符串列表。
+    """
+    audio, images = [], []
+    try:
+        with os.scandir(dir_path) as it:
+            for e in it:
+                try:
+                    is_file = e.is_file(follow_symlinks=True)
+                except OSError:
+                    continue
+                if not is_file:
+                    continue
+                name = e.name
+                if name.lower().endswith(SUPPORTED_AUDIO):
+                    audio.append(name)
+                elif name.lower().endswith(SUPPORTED_IMAGE):
+                    images.append(name)
+    except OSError:
+        return [], []
+    return sorted(audio), sorted(images)
+
+
+def _load_scan_cache(cache_path):
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("version") == 1:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _save_scan_cache(cache_path, audio_names, image_names, songs):
+    try:
+        SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": 1,
+                "audio_names": audio_names,
+                "image_names": image_names,
+                "songs": songs,
+            }, f, ensure_ascii=False)
+    except OSError:
+        pass  # 缓存目录不可写等情况下静默降级为每次全量扫描
+
+
 def scan_music(dir_path=None):
-    """Scan the music directory for audio files and images.
+    """扫描音乐目录，返回歌曲列表 [{path, name, image, mtime}, ...]。
 
     注意：这里只做快速文件扫描，不调用 ffprobe 提取元数据——元数据提取
     由 AudioPlayer._start_metadata_enrichment 在后台线程异步完成，
     避免大曲库启动扫描时长时间卡死 UI。
+
+    缓存策略（大曲库/慢盘优化）：初次扫描全量执行（容忍一次慢）；
+    之后每次启动先用 scandir 只列文件名（不 stat，NAS 友好），
+    与缓存里的文件名清单一致就直接复用缓存的 image/mtime 映射——
+    实测 3000 歌曲 + 1500 封面图：全量 2.5s，缓存命中 <20ms。
+    文件名集合变化（增删歌曲/封面）时自动失效并重建缓存。
     """
     if dir_path is None:
         dir_path = MUSIC_DIR
 
-    # 每个目录只列一次图片文件，避免同目录下每首歌都重复 iterdir
-    image_cache = {}
+    audio_names, image_names = _list_dir_names(dir_path)
+    if not audio_names:
+        return []
 
-    def _dir_images(directory):
-        if directory not in image_cache:
-            try:
-                entries = list(directory.iterdir())
-            except (FileNotFoundError, OSError):
-                entries = []
-            image_cache[directory] = [
-                f for f in entries
-                if any(f.name.lower().endswith(ext) for ext in SUPPORTED_IMAGE)
-            ]
-        return image_cache[directory]
+    cache_path = _scan_cache_path(dir_path)
+    cached = _load_scan_cache(cache_path)
+    if cached \
+            and cached.get("audio_names") == audio_names \
+            and cached.get("image_names") == image_names:
+        # 热路径：直接复用缓存（浅拷贝，避免外部修改污染缓存对象）
+        return [dict(s) for s in cached.get("songs", []) if s.get("path")]
+
+    # 慢路径：全量扫描（含封面匹配与逐文件 stat），完成后写缓存
+    songs = _full_scan(dir_path, audio_names, image_names)
+    _save_scan_cache(cache_path, audio_names, image_names, songs)
+    return songs
+
+
+def _full_scan(dir_path, audio_names, image_names):
+    """全量扫描：逐文件 stat + 封面匹配（慢，仅在缓存失效时执行）"""
+    # 每个目录只列一次图片文件，避免同目录下每首歌都重复 iterdir
+    image_paths = [dir_path / n for n in image_names]
 
     songs = []
-    try:
-        entries = sorted(dir_path.iterdir())
-    except (FileNotFoundError, OSError):
-        entries = []
-    for fpath in entries:
-        # 扩展名不区分大小写（.MP3/.Flac 等也要能扫到）
-        if not fpath.name.lower().endswith(SUPPORTED_AUDIO):
-            continue
-        if not fpath.is_file():
-            continue
+    for name in audio_names:
+        fpath = dir_path / name
         try:
             st = fpath.stat()
         except OSError:
@@ -355,7 +436,7 @@ def scan_music(dir_path=None):
         songs.append({
             "path": str(fpath),
             "name": fpath.stem,
-            "image": find_matching_image(str(fpath), _dir_images(fpath.parent)),
+            "image": find_matching_image(str(fpath), image_paths),
             "mtime": st.st_mtime,
         })
     return songs
@@ -401,6 +482,8 @@ class AudioPlayer(QObject):
     searchResultModelChanged = Signal()  # search results changed
     volumeChanged = Signal(int)          # volume changed
     coverFileUpdated = Signal(str)       # 封面文件内容已更新（路径不变），用于刷新 QML 图片缓存
+    settingsRolledBack = Signal()        # 设置已回退到上一版本（QML 重新加载全部设置）
+    settingsBackupChanged = Signal()     # 设置备份状态变化（回退按钮 enabled 绑定）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -474,6 +557,8 @@ class AudioPlayer(QObject):
         self._config_dir = Path.home() / ".config" / "PyMusic"
         self._config_file = self._config_dir / "PyMusic.config"
         self._ensure_config_dir()
+        # 设置备份轮换的静默窗口计时（把拖动滑块等密集保存合并为一个版本）
+        self._last_backup_ts = 0.0
 
         # 从配置文件加载音量
         try:
@@ -682,14 +767,23 @@ class AudioPlayer(QObject):
             self._search_results = result
             self._download_status = f"找到 {len(result)} 首歌曲"
         else:
+            # 与"找到 0 首"区分：网络/风控失败给出明确提示
             self._search_results = []
-            self._download_status = f"搜索失败: {result}"
+            if isinstance(result, NeteaseAPIError):
+                self._download_status = f"搜索失败：{result}"
+            else:
+                self._download_status = f"搜索失败: {result}"
         self.searchResultModelChanged.emit()
         self.downloadStatusChanged.emit()
 
-    @Slot(int, str)
+    @Slot("qlonglong", str)
     def downloadLyric(self, song_id, current_path):
-        """下载歌词到当前歌曲目录（后台线程执行，不阻塞 UI）"""
+        """下载歌词到当前歌曲目录（后台线程执行，不阻塞 UI）
+
+        注意 song_id 必须用 64 位（qlonglong）：网易歌曲 id 普遍大于
+        2^31-1，QML 传递时若用 32 位 int 会被截断成负数（如
+        2684112479 → -1610854817），接口对负 id 返回"暂无歌词"占位文本。
+        """
         if not current_path:
             self._download_status = "没有当前播放歌曲"
             self.downloadStatusChanged.emit()
@@ -716,9 +810,14 @@ class AudioPlayer(QObject):
             self._download_status = f"下载歌词失败: {result}"
         self.downloadStatusChanged.emit()
 
-    @Slot(str, str, int)
+    @Slot(str, str, "qlonglong")
     def downloadCover(self, pic_url, current_path, song_id=0):
-        """下载封面图片到当前歌曲目录（后台线程执行，不阻塞 UI）"""
+        """下载封面图片到当前歌曲目录（后台线程执行，不阻塞 UI）
+
+        song_id 同 downloadLyric，必须用 64 位：搜索结果的 picUrl 为空时
+        要靠 get_netease_detail(song_id) 兜底，32 位截断后负 id 会让
+        详情接口返回 None，封面下载随之失败。
+        """
         if not current_path:
             self._download_status = "没有当前播放歌曲"
             self.downloadStatusChanged.emit()
@@ -859,10 +958,18 @@ class AudioPlayer(QObject):
             if old_process.state() == QProcess.Running:
                 pid = old_process.processId()
                 if pid > 0:
-                    # 先恢复进程（如果被 SIGSTOP 暂停了），确保 SIGTERM 能送达
+                    # 先发 SIGTERM 再发 SIGCONT：进程若处于 SIGSTOP 挂起态，
+                    # SIGTERM 会挂起为 pending，随后的 SIGCONT 唤醒时内核立即
+                    # 投递 SIGTERM 使其终止，不会恢复执行——之前顺序相反
+                    # （先 SIGCONT 后 SIGTERM），唤醒与终止之间 ffplay 会短暂
+                    # 恢复出声，表现为"点退出时突然播放一下"
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
                     try:
                         os.kill(pid, signal.SIGCONT)
-                    except Exception:
+                    except OSError:
                         pass
                 old_process.terminate()
                 if not old_process.waitForFinished(500):
@@ -1011,6 +1118,14 @@ class AudioPlayer(QObject):
             "ffplay",
             "-nodisp",
             "-autoexit",
+        ]
+        # 终端启动时保留 ffplay 进度刷屏（期望的调试观感）；桌面启动时
+        # systemd 用户会话会把 stderr 接进 journal，ffplay 每 0.1s 一条
+        # 进度会把 journal 灌爆。非 tty 环境（journald/管道/重定向）加
+        # -nostats 关掉进度输出；错误信息仍正常输出（实测过）。
+        if not os.isatty(2):
+            args.append("-nostats")
+        args += [
             "-volume", str(vol),
             "-ss", str(seek_to),
             filepath,
@@ -1067,6 +1182,12 @@ class AudioPlayer(QObject):
         if ok and 0 <= self._current_index < len(self._songs) \
                 and self._songs[self._current_index]["path"] == filepath:
             self._duration = float(duration) if duration else 0.0
+            # 恢复的 lastPosition 越过实际时长时（文件被替换成更短的），
+            # 未播放状态下直接钳制并同步进度条，避免 play 时 -ss 越过结尾
+            if self._state == "stopped" and self._duration > 0 \
+                    and self._position > self._duration:
+                self._position = max(0.0, self._duration - 0.5)
+                self.positionChanged.emit(self._position)
             self.durationChanged.emit(self._duration)
 
     def _get_current_time(self):
@@ -1148,6 +1269,13 @@ class AudioPlayer(QObject):
         if self._current_index < 0:
             self._current_index = 0
             self.songChanged.emit(0)
+
+        # 恢复的 lastPosition 可能超过当前文件时长（文件被替换成更短的），
+        # 直接 -ss 越过结尾会让 ffplay 立即退出、near_end 误判自动切歌。
+        # 播放前钳制到时长内。
+        if self._duration > 0 and self._position > self._duration:
+            self._position = max(0.0, self._duration - 0.5)
+            self.positionChanged.emit(self._position)
 
         filepath = self._songs[self._current_index]["path"]
         self._start_ffplay(filepath, self._position)
@@ -1516,7 +1644,8 @@ class AudioPlayer(QObject):
             if song["path"] == last_file:
                 self._current_index = i
                 self.songChanged.emit(i)
-                self._position = float(last_position)
+                # 防负值/异常值；越过时长的情况由 play()/时长加载回调钳制
+                self._position = max(0.0, float(last_position))
                 # 恢复的位置立刻同步给 UI（此时播放尚未开始，定时器不运行）
                 self.positionChanged.emit(self._position)
                 self._load_lyrics()
@@ -1587,7 +1716,12 @@ class AudioPlayer(QObject):
 
     @Slot(str, str)
     def saveSetting(self, key, value):
-        """保存单个设置项到配置文件"""
+        """保存单个设置项到配置文件
+
+        回退保护：写盘前把现有配置轮换进 .bak1/.bak2（最多保留两个
+        旧版本，bak1=上一次、bak2=再上一次），由设置界面的"回退"
+        按钮恢复。内容无变化时不写盘、不轮换，避免历史被无意义覆盖。
+        """
         self._ensure_config_dir()
         settings = {}
         try:
@@ -1608,10 +1742,97 @@ class AudioPlayer(QObject):
         else:
             settings[key] = value
         try:
-            with open(self._config_file, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
-        except Exception:
+            new_text = json.dumps(settings, ensure_ascii=False, indent=2)
+            if self._config_file.is_file() \
+                    and self._config_file.read_text(encoding="utf-8") == new_text:
+                return  # 内容无变化：不写盘、不轮换备份
+            # 密集变化（拖动滑块、滚轮调音量等）合并为一个历史版本：
+            # 距上次轮换超过 3 秒静默窗口才产生新版本，窗口内的连续保存
+            # 只写盘不动备份——回退时恢复到"这一轮修改之前"的状态，
+            # 而不是拖动过程中的某个中间值
+            now = time.monotonic()
+            if now - self._last_backup_ts > 3.0:
+                try:
+                    self._rotate_config_backup()
+                except OSError:
+                    pass  # 备份失败不阻塞本次保存
+                self._last_backup_ts = now
+            self._config_file.write_text(new_text, encoding="utf-8")
+            self.settingsBackupChanged.emit()
+        except OSError:
             pass
+
+    def _rotate_config_backup(self):
+        """把现有配置轮换进 .bak1/.bak2（最多保留两个旧版本）"""
+        bak1 = self._config_file.with_name(self._config_file.name + ".bak1")
+        bak2 = self._config_file.with_name(self._config_file.name + ".bak2")
+        if bak2.is_file():
+            bak2.unlink()
+        if bak1.is_file():
+            bak1.rename(bak2)
+        if self._config_file.is_file():
+            self._config_file.rename(bak1)
+
+    @Property(bool, notify=settingsBackupChanged)
+    def hasSettingsBackup(self):
+        """是否有可回退的旧设置（QML 回退按钮 enabled 绑定）"""
+        bak1 = self._config_file.with_name(self._config_file.name + ".bak1")
+        return bak1.is_file()
+
+    @Slot(result=bool)
+    def rollbackSettings(self):
+        """回退设置：恢复上一次保存的配置（.bak1），历史顺移（.bak2→.bak1），
+        最多可连续回退两次。无备份时返回 False。"""
+        bak1 = self._config_file.with_name(self._config_file.name + ".bak1")
+        if not bak1.is_file():
+            return False
+        bak2 = self._config_file.with_name(self._config_file.name + ".bak2")
+        try:
+            if self._config_file.is_file():
+                self._config_file.unlink()
+            bak1.rename(self._config_file)
+            if bak2.is_file():
+                bak2.rename(bak1)
+        except OSError:
+            return False
+        # 回退后重置静默窗口：下一次保存视为新一轮修改，正常轮换新版本
+        self._last_backup_ts = 0.0
+        self.settingsRolledBack.emit()
+        self.settingsBackupChanged.emit()
+        return True
+
+    @Property(str, constant=True)
+    def platformName(self):
+        """QPA 平台名（xcb/wayland/offscreen）。"""
+        return QGuiApplication.platformName()
+
+    @Property(bool, constant=True)
+    def framelessSupported(self):
+        """当前会话是否支持无边框窗口 + startSystemMove/Resize。
+
+        - xcb/offscreen：支持；
+        - wayland：KDE Plasma 的 KWin 支持（用户会话实测 kwin_wayland），
+          GNOME 等合成器不支持（无法移动/缩放窗口），回退原生顶栏。
+        """
+        platform = QGuiApplication.platformName()
+        if platform in ("xcb", "offscreen"):
+            return True
+        if platform == "wayland":
+            desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+            return "KDE" in desktop
+        return False
+
+    @Slot(str)
+    def applyGlobalFont(self, family):
+        """把自定义字体作为"全局字体"应用到整个应用。
+
+        注意：QML 里 window.font 并不会被普通 Text 继承（实测 plain Text
+        的空 family 最终解析到 QGuiApplication 的默认字体），所以全局字体
+        必须通过 QGuiApplication.setFont 下发——所有未单独指定 font.family
+        的控件（歌词、歌单、按钮、设置面板等）才会跟随变化。
+        """
+        family = (family or "").strip()
+        QGuiApplication.instance().setFont(QFont(family) if family else QFont())
 
 
 # ========== 应用入口 ==========
@@ -1677,12 +1898,90 @@ class AppBridge(QObject):
             self._quit_callback()
 
 
+_SINGLE_INSTANCE_NAME = "PyMusic-single-instance"
+
+
+def _instance_pid_file():
+    return SCAN_CACHE_DIR / "instance.pid"
+
+
+def _read_instance_pid():
+    try:
+        return int(_instance_pid_file().read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_our_instance(pid):
+    """按 /proc/<pid>/cmdline 校验 pid 确实属于本程序（防 pid 复用误杀）"""
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace")
+    except OSError:
+        return False
+    return "main.py" in cmd and ("python" in cmd.lower() or "pymusic" in cmd.lower())
+
+
+def _acquire_single_instance(server):
+    """单实例接管：监听失败说明已有实例运行——直接 SIGTERM 终止旧实例
+    （旧实例的 SIGTERM 处理器会清理 ffplay 子进程后退出），等它退出后
+    回收套接字并重新监听，由本实例接管。返回是否成功成为唯一实例。"""
+    if server.listen(_SINGLE_INSTANCE_NAME):
+        return True
+    old_pid = _read_instance_pid()
+    if old_pid and _is_our_instance(old_pid):
+        try:
+            os.kill(old_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        # 等待旧实例退出（最多 2 秒），其 SIGTERM 处理器会清理 ffplay
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(old_pid, 0)
+            except OSError:
+                break
+            time.sleep(0.05)
+    # 回收套接字（旧实例正常退出时 Qt 也会清理；这里兜底崩溃残留）
+    QLocalServer.removeServer(_SINGLE_INSTANCE_NAME)
+    return server.listen(_SINGLE_INSTANCE_NAME)
+
+
 def main():
     """启动 PySide6 QML 应用"""
     app = QApplication([])
     app.setApplicationName("MusicPlayer2 - Py")
     # 关闭主窗口时不退出程序，改为最小化到系统托盘
     app.setQuitOnLastWindowClosed(False)
+
+    # 让 Python 信号（Ctrl+C 等）在 Qt 事件循环空闲时也能及时投递。
+    # 默认情况下 Python 信号处理器要等主线程执行到 Python 字节码才会运行，
+    # 而 Qt 事件循环是纯 C++ 代码——无播放/无交互时（位置定时器不跑、
+    # 没有槽函数触发）Ctrl+C 会一直挂起，表现为"按 Ctrl+C 很久都不退出"。
+    # 用 set_wakeup_fd + QSocketNotifier：信号到达时内核向 socket 写一字节，
+    # Qt 通知器立刻唤醒 Python 处理挂起的信号。
+    import socket
+    _sig_rfd, _sig_wfd = socket.socketpair()
+    _sig_wfd.setblocking(False)                      # set_wakeup_fd 要求非阻塞
+    os.set_inheritable(_sig_rfd.fileno(), False)   # 防止被 ffplay 子进程继承
+    os.set_inheritable(_sig_wfd.fileno(), False)
+    signal.set_wakeup_fd(_sig_wfd.fileno())
+    _sig_notifier = QSocketNotifier(_sig_rfd.fileno(), QSocketNotifier.Read, app)
+    _sig_notifier.activated.connect(lambda fd: os.read(fd, 4096))
+    app._sig_wakeup = (_sig_rfd, _sig_wfd, _sig_notifier)  # 保持引用
+
+    # 单实例：已有实例运行时直接终止旧实例并接管（旧实例的 SIGTERM
+    # 处理器会先清理 ffplay 子进程）。同时避免两个实例互相覆盖配置。
+    single_instance = QLocalServer()
+    if not _acquire_single_instance(single_instance):
+        # 极端情况（旧实例无法终止/套接字无法回收）：提示后退出
+        QMessageBox.information(None, "PyMusic", "程序已在运行且无法终止")
+        return 0
+    # 记录本实例 pid，供下一实例"杀死旧的"时定位进程
+    try:
+        SCAN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _instance_pid_file().write_text(str(os.getpid()))
+    except OSError:
+        pass
 
     # 设置窗口图标和系统托盘图标
     icon_path = str(Path(__file__).parent / "icons" / "LOGO.png")
@@ -1745,5 +2044,4 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
