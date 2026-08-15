@@ -45,8 +45,6 @@ jobs:
           cp main.py api.py main.qml appdir/pymusic/
           cp -r icons appdir/pymusic/
           cp icons/LOGO.png appdir/PyMusic/PyMusic.png
-          # 注意：desktop 里的 python3.14 与下方基础镜像版本绑定，
-          # 换基础镜像时需同步修改
           cat > appdir/PyMusic/PyMusic.desktop <<'DESKTOP'
           [Desktop Entry]
           Type=Application
@@ -80,15 +78,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 每次构建 = 一个独立 release（tag: nightly-日期-短提交号）
           VERSION="$(date +%Y%m%d)-${GITHUB_SHA::7}"
           ASSET="PyMusic-x86_64-${VERSION}.AppImage"
           cp PyMusic-x86_64.AppImage "$ASSET"
-          gh release create "nightly-${VERSION}" "$ASSET" \
+          gh release create "新的提交-${VERSION}" "$ASSET" \
             --prerelease \
-            --title "Nightly ${VERSION}" \
+            --title "提交 ${VERSION}" \
             --notes "由提交 ${GITHUB_SHA} 自动构建"
-          # 只保留最近 5 个 nightly release, 删除更旧的版本
           gh release list --limit 100 --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("nightly-"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
             while read -r tag; do
