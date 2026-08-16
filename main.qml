@@ -613,8 +613,8 @@ ApplicationWindow {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        // X = 直接退出程序（不走 closeToTray 的隐藏逻辑）
-                        onClicked: appBridge.quitApp()
+                        // X = 退出（300ms 音量淡出后退出，不走 closeToTray 的隐藏逻辑）
+                        onClicked: player.fadeOutQuit()
                     }
                 }
             }
@@ -898,9 +898,30 @@ ApplicationWindow {
 
                                 Item { Layout.fillWidth: true }
 
+                                // 本地曲库搜索框（圆角，风格与设置面板输入框一致）
+                                TextField {
+                                    id: songSearchInput
+                                    Layout.preferredWidth: 150
+                                    height: 26
+                                    placeholderText: "搜索歌曲..."
+                                    color: textPrimary
+                                    font.pixelSize: 12
+                                    selectByMouse: true
+                                    onTextChanged: player.setSongSearch(text)
+                                    background: Rectangle {
+                                        implicitWidth: 150
+                                        implicitHeight: 26
+                                        radius: 6
+                                        // 底色透明：与面板融为一体，仅保留描边
+                                        color: "transparent"
+                                        border.color: darkMode ? "#334466" : "#ccccd0"
+                                        border.width: 1
+                                    }
+                                }
+
                                 Text {
                                     font.family: window.uiFontFamily
-                                    text: player.songCount + " 首"
+                                    text: player.filteredSongCount + " 首"
                                     color: textMuted
                                     font.pixelSize: 12
                                 }
@@ -914,7 +935,9 @@ ApplicationWindow {
                             Layout.fillHeight: true
                             clip: true
                             model: player.songListModel
-                            currentIndex: player.currentIndex
+                            // 搜索过滤时禁用 currentIndex 跟随（过滤后列表位置与
+                            // 完整列表索引不对应，高亮由 delegate 的 modelData.index 负责）
+                            currentIndex: songSearchInput.text === "" ? player.currentIndex : -1
                             boundsBehavior: Flickable.StopAtBounds
                             flickDeceleration: 3000
                             maximumFlickVelocity: 4000
@@ -954,6 +977,9 @@ ApplicationWindow {
                             // 用户正在手动滚动
                             property bool _userScrolling: dragging || flicking
 
+                            // 搜索激活（搜索框有文字）：居中占位失效，列表从顶部排列
+                            property bool _searching: songSearchInput.text !== ""
+
                             function _freeze() {
                                 songListView._frozenH = Math.max(0,
                                     songListView._centerOffset - songListView.currentIndex * songListView._itemHeight)
@@ -986,20 +1012,26 @@ ApplicationWindow {
                             }
 
                             onCurrentIndexChanged: {
-                                if (!songListView._userScrolling) {
+                                // 搜索激活时不自动滚动（过滤后列表位置与播放索引不对应）
+                                if (songListView._searching || songListView._userScrolling) {
                                     songListView._unfreeze()
-                                    var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
-                                    songListView.contentY = Math.max(0, targetY)
+                                    return
                                 }
+                                songListView._unfreeze()
+                                var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
+                                songListView.contentY = Math.max(0, targetY)
                             }
 
                             headerPositioning: ListView.InlineHeader
                             footerPositioning: ListView.InlineFooter
 
                             header: Item {
-                                height: songListView._frozen
-                                    ? songListView._frozenH
-                                    : Math.max(0, songListView._centerOffset - songListView.currentIndex * songListView._itemHeight)
+                                // 搜索激活时占位归零（过滤结果从顶部排列，不"悬浮"）
+                                height: songListView._searching
+                                    ? 0
+                                    : (songListView._frozen
+                                        ? songListView._frozenH
+                                        : Math.max(0, songListView._centerOffset - songListView.currentIndex * songListView._itemHeight))
                                 Behavior on height { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
                                 clip: true
                                 Text {
@@ -1018,10 +1050,13 @@ ApplicationWindow {
                                 }
                             }
                             footer: Item {
-                                height: songListView._frozen
-                                    ? songListView._frozenF
-                                    : Math.max(0, songListView.height - songListView._viewCenter - songListView._itemHeight * 0.5
-                                                 - (player.songCount - 1 - songListView.currentIndex) * songListView._itemHeight)
+                                // 搜索激活时占位归零
+                                height: songListView._searching
+                                    ? 0
+                                    : (songListView._frozen
+                                        ? songListView._frozenF
+                                        : Math.max(0, songListView.height - songListView._viewCenter - songListView._itemHeight * 0.5
+                                                     - (player.songCount - 1 - songListView.currentIndex) * songListView._itemHeight))
                                 Behavior on height { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
                                 clip: true
                                 Text {
@@ -1041,6 +1076,7 @@ ApplicationWindow {
                             }
 
                             Component.onCompleted: Qt.callLater(function() {
+                                if (songListView._searching) return
                                 var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
                                 songListView.contentY = Math.max(0, targetY)
                             })
@@ -1051,6 +1087,7 @@ ApplicationWindow {
                                     if (playlistVisible) {
                                         Qt.callLater(function() {
                                             songListView._unfreeze()
+                                            if (songListView._searching) return
                                             var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
                                             songListView.contentY = Math.max(0, targetY)
                                         })
@@ -1062,6 +1099,7 @@ ApplicationWindow {
                                 target: player
                                 function onSortModeChanged() {
                                     songListView._unfreeze()
+                                    if (songListView._searching) return
                                     var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
                                     songListView.contentY = Math.max(0, targetY)
                                 }
@@ -1070,8 +1108,11 @@ ApplicationWindow {
                             delegate: Rectangle {
                                 width: songListView.width
                                 height: rowSpacing
+                                // 高亮/序号/点击全部用 modelData.index（完整列表下标）：
+                                // 搜索过滤后 delegate 的 index 是过滤后的位置，
+                                // 不能用于与播放索引比较
                                 color: {
-                                    if (index === player.currentIndex) return Qt.rgba(0.913, 0.271, 0.376, 0.15)
+                                    if (modelData.index === player.currentIndex) return Qt.rgba(0.913, 0.271, 0.376, 0.15)
                                     if (mouseArea.containsMouse) return Qt.rgba(1, 1, 1, 0.04)
                                     return "transparent"
                                 }
@@ -1088,16 +1129,16 @@ ApplicationWindow {
                                         Layout.preferredWidth: 24
                                         Layout.preferredHeight: 24
                                         radius: 12
-                                        color: index === player.currentIndex ? accent : "transparent"
-                                        border.width: index === player.currentIndex ? 0 : 1
+                                        color: modelData.index === player.currentIndex ? accent : "transparent"
+                                        border.width: modelData.index === player.currentIndex ? 0 : 1
                                         border.color: textMuted
 
                                         Text {
                                             font.family: window.uiFontFamily
                                             anchors.centerIn: parent
-                                            text: index === player.currentIndex ? "▶" : (index + 1)
-                                            color: index === player.currentIndex ? "#fff" : textMuted
-                                            font.pixelSize: index === player.currentIndex ? 10 : 11
+                                            text: modelData.index === player.currentIndex ? "▶" : (modelData.index + 1)
+                                            color: modelData.index === player.currentIndex ? "#fff" : textMuted
+                                            font.pixelSize: modelData.index === player.currentIndex ? 10 : 11
                                         }
                                     }
 
@@ -1105,10 +1146,10 @@ ApplicationWindow {
                                     Text {
                                         font.family: window.uiFontFamily
                                         Layout.fillWidth: true
-                                        text: player.songName(index) || "未知"
-                                        color: index === player.currentIndex ? accent : textPrimary
+                                        text: modelData.name || "未知"
+                                        color: modelData.index === player.currentIndex ? accent : textPrimary
                                         font.pixelSize: 13
-                                        font.bold: index === player.currentIndex
+                                        font.bold: modelData.index === player.currentIndex
                                         elide: Text.ElideRight
                                     }
 
@@ -1120,7 +1161,7 @@ ApplicationWindow {
                                     hoverEnabled: true
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: {
-                                        player.currentIndex = index
+                                        player.currentIndex = modelData.index
                                         window.switchToLyric()
                                         player.play()
                                     }

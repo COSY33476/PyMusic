@@ -505,6 +505,8 @@ class AudioPlayer(QObject):
         self._play_mode = 0  # 0=顺序, 1=单曲循环, 2=随机
         # 随机模式下的播放历史（用于"上一首"回退，最多 50 条）
         self._play_history = []
+        # 播放列表本地搜索词（小写，匹配歌曲名/文件名）
+        self._song_search = ""
         self._current_index = -1
         self._song_list_model_cache = None
         self._sort_songs()
@@ -520,6 +522,16 @@ class AudioPlayer(QObject):
         self._position_timer = QTimer(self)
         self._position_timer.setInterval(250)
         self._position_timer.timeout.connect(self._update_position)
+
+        # 暂停/恢复的音量渐变（PA 平滑淡出淡入，250ms）
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(30)
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+        self._fade_direction = None   # None / "out"(暂停淡出) / "in"(恢复淡入) / "quit"(退出淡出)
+        self._fade_step = 0
+        self._fade_total = 0
+        # 退出淡出完成后要执行的退出回调（由 main() 注入 quit_app）
+        self._quit_callback = None
 
         # 歌词数据
         self._lyrics = []  # list of (time_seconds, text) tuples
@@ -608,13 +620,43 @@ class AudioPlayer(QObject):
 
     @Property("QVariantList", notify=songListChanged)
     def songListModel(self):
-        """返回歌曲列表模型数据，每次排序/变更时重建列表"""
+        """返回歌曲列表模型数据，每次排序/变更时重建列表
+
+        支持本地搜索过滤：命中搜索词（歌名/文件名小写包含）的项才会出现，
+        每项带 index 字段指向完整列表（_songs）下标，供 QML 高亮/点击
+        与播放索引对齐。
+        """
         if self._song_list_model_cache is None:
-            self._song_list_model_cache = [
-                {"name": s["name"], "path": s["path"], "image": s["image"]}
-                for s in self._songs
-            ]
+            cache = []
+            search = self._song_search
+            for i, s in enumerate(self._songs):
+                if search and search not in s["name"].lower():
+                    continue
+                cache.append({
+                    "name": s["name"],
+                    "path": s["path"],
+                    "image": s["image"],
+                    "index": i,
+                })
+            self._song_list_model_cache = cache
         return self._song_list_model_cache
+
+    @Slot(str)
+    def setSongSearch(self, text):
+        """设置播放列表本地搜索词（过滤歌曲列表模型）"""
+        text = (text or "").strip().lower()
+        if text != self._song_search:
+            self._song_search = text
+            self._song_list_model_cache = None
+            self.songListChanged.emit()
+
+    @Property(int, notify=songListChanged)
+    def filteredSongCount(self):
+        """搜索过滤后的歌曲数量（头部"N 首"显示用）"""
+        if not self._song_search:
+            return len(self._songs)
+        return sum(1 for s in self._songs
+                   if self._song_search in s["name"].lower())
 
     # ========== 音乐目录管理 ==========
 
@@ -635,6 +677,7 @@ class AudioPlayer(QObject):
             self._sort_songs()
             self._current_index = -1
             self._song_list_model_cache = None
+            self._song_search = ""
             self.songListChanged.emit()
             self.songChanged.emit(-1)
             self.musicDirChanged.emit()
@@ -970,6 +1013,7 @@ class AudioPlayer(QObject):
 
     def _kill_process(self):
         """终止当前 ffplay 进程并清理资源"""
+        self._cancel_fade()
         old_process = self._process
         if old_process:
             # Disconnect the finished signal to prevent side effects
@@ -1090,6 +1134,109 @@ class AudioPlayer(QObject):
         except Exception:
             self._pa_available = None
             return False
+
+    def _pa_set_volume(self, pid, pa_vol):
+        """对指定进程的 PA sink-input 设置音量（0-65536）。失败返回 False"""
+        sink_id = self._find_sink_input_id(pid)
+        if sink_id is None:
+            return False
+        try:
+            result = subprocess.run(
+                ["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
+                capture_output=True, timeout=5
+            )
+            if result.returncode == 0:
+                return True
+            self._pa_available = None
+            return False
+        except Exception:
+            self._pa_available = None
+            return False
+
+    def _cancel_fade(self):
+        """取消进行中的音量渐变（切歌/停止/seek 时调用）"""
+        if self._fade_direction is not None:
+            self._fade_timer.stop()
+            self._fade_direction = None
+
+    def setQuitCallback(self, callback):
+        """注入退出回调（quit_app）：退出淡出完成后调用"""
+        self._quit_callback = callback
+
+    @Slot()
+    def fadeOutQuit(self):
+        """退出淡出：PA 音量 300ms 平滑降到 0 后终止进程并触发退出回调。
+
+        PA 不可用/无运行进程时直接退出（无淡出可做）。
+        """
+        if not self._quit_callback:
+            self.cleanup()
+            return
+        # 若正在暂停淡出/淡入，先取消再走退出淡出
+        if self._fade_direction is not None:
+            self._cancel_fade()
+        if self._start_fade("quit", duration_ms=300):
+            return  # 完成后在 _on_fade_tick 的 "quit" 分支继续
+        self.cleanup()
+        self._quit_callback()
+
+    def _start_fade(self, direction, duration_ms=250):
+        """开始 PA 音量渐变：out=淡出到 0（暂停），in=淡入（恢复），
+        quit=淡出到 0 后终止进程并退出。
+
+        duration_ms: 渐变时长（默认 250，退出淡出用 300）。
+        返回 False 表示 PA 不可用/sink 未注册（调用方应走硬切逻辑）。
+        """
+        if not self._process or self._process.state() != QProcess.Running:
+            return False
+        pid = self._process.processId()
+        if not pid:
+            return False
+        if self._find_sink_input_id(pid) is None:
+            return False
+        self._fade_direction = direction
+        self._fade_step = 0
+        self._fade_total = max(1, round(duration_ms / self._fade_timer.interval()))
+        self._fade_timer.start()
+        return True
+
+    def _on_fade_tick(self):
+        """渐变定时器：每 30ms 调一次 PA 音量，到终点执行挂起/恢复"""
+        if self._fade_direction is None:
+            self._fade_timer.stop()
+            return
+        if not self._process or self._process.state() != QProcess.Running:
+            self._cancel_fade()
+            return
+        pid = self._process.processId()
+        self._fade_step += 1
+        t = self._fade_step / self._fade_total
+        if self._fade_direction == "in":
+            pa_vol = int(self._volume / 100.0 * 65536 * t)
+        else:
+            # "out"(暂停淡出) 与 "quit"(退出淡出) 都是淡出到 0
+            pa_vol = int(self._volume / 100.0 * 65536 * (1.0 - t))
+        ok = self._pa_set_volume(pid, pa_vol)
+        if t >= 1.0 or not ok:
+            self._fade_timer.stop()
+            direction = self._fade_direction
+            self._fade_direction = None
+            if direction == "quit":
+                # 退出淡出完成：音量已近 0，终止进程并触发退出回调
+                self._kill_process()
+                if self._quit_callback:
+                    self._quit_callback()
+            elif direction == "out":
+                # 淡出完成：音量已近 0，挂起进程并转暂停态
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except OSError:
+                    pass
+                self._pause_time = self._get_current_time()
+                self._state = "paused"
+                self.stateChanged.emit("paused")
+                self._position_timer.stop()
+            # "in" 完成：音量已到当前值，无需额外动作（state 已 playing）
 
     def _retry_pa_volume(self, process_ref, attempt):
         """异步、不阻塞地重试将 PA 音量纠正到当前设置值。
@@ -1308,6 +1455,9 @@ class AudioPlayer(QObject):
     def pause(self):
         """暂停当前播放（通过 SIGSTOP 暂停 ffplay 进程）
 
+        有 PulseAudio 时先做 250ms 平滑淡出（音量降到 0 后再 SIGSTOP，
+        避免瞬间无声）；无 PA 时退回直接挂起。
+
         ffplay 可能仍处于 Starting 状态（启动中）：此时直接 SIGSTOP 无效。
         把暂停动作挂到 started 信号上，进程真正起来后再立刻挂起；
         _pause_time 也在真正挂起的那一刻记录，保证 resume() 计算的
@@ -1315,11 +1465,16 @@ class AudioPlayer(QObject):
         """
         if self._state != "playing":
             return
+        if self._fade_direction == "out":
+            return  # 正在淡出中，忽略重复暂停
         if self._process and self._process.state() == QProcess.Running:
             pid = self._process.processId()
             if pid > 0:
+                # PA 可用时平滑淡出；淡出完成回调里才 SIGSTOP + 转 paused
+                if self._start_fade("out"):
+                    return
                 os.kill(pid, signal.SIGSTOP)
-            self._pause_time = self._get_current_time()
+                self._pause_time = self._get_current_time()
         elif self._process and self._process.state() == QProcess.Starting:
             self._process.started.connect(self._pause_new_process)
         self._state = "paused"
@@ -1328,23 +1483,32 @@ class AudioPlayer(QObject):
 
     @Slot()
     def resume(self):
-        """恢复播放（通过 SIGCONT 继续 ffplay 进程）"""
+        """恢复播放（通过 SIGCONT 继续 ffplay 进程）
+
+        有 PulseAudio 时 SIGCONT 后做 250ms 平滑淡入（音量 0→当前值），
+        期间 UI 立即恢复播放态；无 PA 时直接出声。
+        """
         if self._state != "paused":
             return
+        if self._fade_direction == "in":
+            return  # 正在淡入中，忽略重复恢复
         # 进程已挂起时才 SIGCONT 并补偿暂停时长；
         # 进程还在启动中（Starting，_pause_new_process 尚未触发）时跳过补偿。
         if self._process and self._process.state() == QProcess.Running:
             pid = self._process.processId()
             if pid > 0:
                 os.kill(pid, signal.SIGCONT)
-            self._total_paused_duration += self._get_current_time() - self._pause_time
+                self._total_paused_duration += self._get_current_time() - self._pause_time
+                # PA 平滑淡入；失败（无 PA/sink 未注册）则直接出声
+                self._start_fade("in")
         self._state = "playing"
         self.stateChanged.emit("playing")
         self._position_timer.start()
 
-        # 应用暂停期间累积但未生效的音量变更
+        # 应用暂停期间累积但未生效的音量变更。
+        # 淡入进行中时跳过：渐变结束时音量已经是 _volume，无需再调整
         if self._volume_dirty:
-            if not self._adjust_volume_pa():
+            if self._fade_direction is None and not self._adjust_volume_pa():
                 elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
                 pos = max(0.0, self._seek_base + elapsed)
                 # 时长未知（异步 ffprobe 还没返回）时不能按 0 clamp，否则会从头播放
@@ -2118,6 +2282,8 @@ def main():
     bridge.setQuitCallback(quit_app)
     bridge.setTrayAvailable(QSystemTrayIcon.isSystemTrayAvailable())
     engine.rootContext().setContextProperty("appBridge", bridge)
+    # 退出淡出：X 按钮走 player.fadeOutQuit()，淡出完成后调用同一退出回调
+    player.setQuitCallback(quit_app)
 
     # 托盘右键菜单：显示主窗口 / 退出
     tray_menu = QMenu()
