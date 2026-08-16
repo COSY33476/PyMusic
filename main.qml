@@ -114,6 +114,14 @@ ApplicationWindow {
         settingsVisible = !settingsVisible
     }
 
+    // 颜色线性插值：t=0 → 精确 c1，t=1 → 精确 c2（含 alpha）
+    function mixColor(c1, c2, t) {
+        return Qt.rgba(c1.r + (c2.r - c1.r) * t,
+                       c1.g + (c2.g - c1.g) * t,
+                       c1.b + (c2.b - c1.b) * t,
+                       c1.a + (c2.a - c1.a) * t)
+    }
+
     // 下载面板状态
     property bool downloadVisible: false
 
@@ -1622,7 +1630,10 @@ ApplicationWindow {
                                             var played = window._resolvedLyricPlayedColor
                                             var highlight = window._resolvedLyricColor
                                             var base = (lyricRow._groupIdx < lyricView.currentGroupIndex) ? played : unplayed
-                                            return Qt.tint(base, Qt.rgba(highlight.r, highlight.g, highlight.b, lyricRow.highlightProgress * 0.9))
+                                            // 线性 RGB 插值：progress=1 时精确等于设定高亮色，
+                                            // progress=0 时精确等于底色。Qt.tint 是叠加运算，
+                                            // 永远到不了目标色（满高亮时是"底色染粉"的混合色）
+                                            return window.mixColor(base, highlight, lyricRow.highlightProgress)
                                         }
 
                                         font.pixelSize: 14
@@ -2022,6 +2033,59 @@ ApplicationWindow {
                     }
 
                     Item { Layout.fillWidth: true; visible: player.state === "stopped" }
+
+                    // 播放模式（顺序/单曲循环/随机）按钮：位于播放列表按钮左侧
+                    Rectangle {
+                        id: playModeBtn
+                        width: 45
+                        height: 45
+                        radius: 22
+                        color: hideControlBackgrounds ? "transparent" : (playModeBtnMouse.containsPress ? accentHover : accent)
+                        Behavior on color { ColorAnimation { duration: 100 } }
+
+                        Image {
+                            id: playModeIconImg
+                            anchors.centerIn: parent
+                            width: 24
+                            height: 24
+                            source: {
+                                switch (player.playMode) {
+                                    case 0: return "icons/repeat.svg"        // 顺序
+                                    case 1: return "icons/repeat-one.svg"    // 单曲循环
+                                    default: return "icons/shuffle.svg"      // 随机
+                                }
+                            }
+                            sourceSize.width: 24
+                            sourceSize.height: 24
+                            visible: false
+                        }
+
+                        ColorOverlay {
+                            anchors.fill: playModeIconImg
+                            source: playModeIconImg
+                            color: window.darkMode ? "#ffffff" : "#000000"
+                        }
+
+                        MouseArea {
+                            id: playModeBtnMouse
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            hoverEnabled: true
+                            onClicked: player.playMode = (player.playMode + 1) % 3
+                        }
+
+                        ToolTip {
+                            visible: playModeBtnMouse.containsMouse
+                            text: {
+                                switch (player.playMode) {
+                                    case 0: return "顺序播放"
+                                    case 1: return "单曲循环"
+                                    default: return "随机播放"
+                                }
+                            }
+                            delay: 500
+                        }
+                    }
 
                     // 折叠/展开播放列表按钮
                     Rectangle {

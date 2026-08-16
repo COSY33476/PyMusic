@@ -2,6 +2,7 @@
 """MusicPlayer2 - PySide6 + QML 音频播放器"""
 
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -466,7 +467,7 @@ class AudioPlayer(QObject):
     # 其它键（musicDir 等路径，可能包含纯数字目录名）一律保持字符串。
     _BOOL_SETTING_KEYS = {"darkMode", "hideControlBackgrounds", "autoSwitchToLyric", "closeToTray"}
     _NUMERIC_SETTING_KEYS = {"volume", "sortMode", "blurRadius", "panelOpacity",
-                             "rowSpacing", "lastPosition"}
+                             "rowSpacing", "lastPosition", "playMode"}
 
     # Signals emitted to QML
     positionChanged = Signal(float)  # current position in seconds
@@ -478,6 +479,7 @@ class AudioPlayer(QObject):
     lyricsChanged = Signal()         # lyrics list changed
     musicDirChanged = Signal()       # music directory changed
     sortModeChanged = Signal()       # sort mode changed
+    playModeChanged = Signal()       # play mode changed
     downloadStatusChanged = Signal()  # download status text changed
     searchResultModelChanged = Signal()  # search results changed
     volumeChanged = Signal(int)          # volume changed
@@ -500,6 +502,9 @@ class AudioPlayer(QObject):
         self._music_dir = MUSIC_DIR
         self._songs = scan_music(self._music_dir)
         self._sort_mode = 0  # 0=name asc, 1=name desc, 2=time asc, 3=time desc
+        self._play_mode = 0  # 0=顺序, 1=单曲循环, 2=随机
+        # 随机模式下的播放历史（用于"上一首"回退，最多 50 条）
+        self._play_history = []
         self._current_index = -1
         self._song_list_model_cache = None
         self._sort_songs()
@@ -565,6 +570,8 @@ class AudioPlayer(QObject):
             settings = self.loadSettings()
             if "volume" in settings:
                 self._volume = max(0, min(100, int(settings["volume"])))
+            if "playMode" in settings:
+                self._play_mode = max(0, min(2, int(settings["playMode"])))
         except Exception:
             pass
 
@@ -728,6 +735,21 @@ class AudioPlayer(QObject):
             self._sort_mode = mode
             self._sort_songs()
             self.sortModeChanged.emit()
+
+    # ========== 播放模式 ==========
+
+    @Property(int, notify=playModeChanged)
+    def playMode(self):
+        """播放模式：0=顺序, 1=单曲循环, 2=随机（QML 可绑定）"""
+        return self._play_mode
+
+    @playMode.setter
+    def playMode(self, mode):
+        mode = mode % 3
+        if mode != self._play_mode:
+            self._play_mode = mode
+            self.saveSetting("playMode", str(mode))
+            self.playModeChanged.emit()
 
     # ========== 下载面板：搜索 & 下载 ==========
 
@@ -1252,7 +1274,7 @@ class AudioPlayer(QObject):
             elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
             near_end = elapsed >= 1.0
         if near_end:
-            self.next()
+            self._handle_song_finished()
             return
 
         # 正常退出（exit 0）却没到结尾：ffplay 遇到损坏/截断文件会静默正常退出
@@ -1365,16 +1387,88 @@ class AudioPlayer(QObject):
         """切换到上一首歌曲"""
         self._switch_song(-1)
 
-    def _switch_song(self, delta):
-        """按 delta 切换歌曲（+1 下一首 / -1 上一首），并在非停止状态下自动播放"""
-        if len(self._songs) == 0:
+    def _push_play_history(self):
+        """记录当前歌曲到随机播放历史（供"上一首"回退）"""
+        if self._current_index >= 0:
+            self._play_history.append(self._current_index)
+            if len(self._play_history) > 50:
+                self._play_history.pop(0)
+
+    def _handle_song_finished(self):
+        """歌曲自然播放结束：按播放模式决定后续行为
+
+        0=顺序：自动切到下一首（列表尾回到头）
+        1=单曲循环：重新播放当前歌曲
+        2=随机：随机选一首不同的歌曲播放
+        """
+        n = len(self._songs)
+        if n == 0:
             return
         if self._current_index < 0:
-            # 尚未选择歌曲：下一首从第一首开始，上一首从最后一首开始
-            # （(-1 + -1) % n 会得到 n-2，直接取模是错的）
-            self._current_index = len(self._songs) - 1 if delta < 0 else 0
+            # 无有效当前歌曲：按顺序从第一首开始
+            self._switch_song(1)
+            return
+        if self._play_mode == 1:
+            # 单曲循环：从 0 重新播放当前歌曲
+            self._position = 0.0
+            self.positionChanged.emit(0.0)
+            if self._state != "stopped":
+                filepath = self._songs[self._current_index]["path"]
+                self._start_ffplay(filepath, 0.0)
+                self._state = "playing"
+                self.stateChanged.emit("playing")
+        elif self._play_mode == 2:
+            # 随机：避免与当前歌曲重复，当前歌曲记入历史
+            candidates = [i for i in range(n) if i != self._current_index]
+            if not candidates:
+                return
+            self._push_play_history()
+            self._current_index = random.choice(candidates)
+            self.songChanged.emit(self._current_index)
+            self._position = 0.0
+            self.positionChanged.emit(0.0)
+            if self._state != "stopped":
+                filepath = self._songs[self._current_index]["path"]
+                self._start_ffplay(filepath, 0.0)
+                self._state = "playing"
+                self.stateChanged.emit("playing")
         else:
-            self._current_index = (self._current_index + delta) % len(self._songs)
+            # 顺序播放：切到下一首（原逻辑）
+            self.next()
+
+    def _switch_song(self, delta):
+        """按 delta 切换歌曲（+1 下一首 / -1 上一首），并在非停止状态下自动播放
+
+        随机模式（playMode==2）下手动切歌也遵循随机：下一首=随机选一首
+        不同的，上一首=回退到最近播放过的歌曲（无历史则随机）——否则
+        随机模式只是"自然播放结束"随机、按键却是顺序，行为不一致。
+        """
+        if len(self._songs) == 0:
+            return
+        if self._play_mode == 2:
+            if delta > 0:
+                # 下一首：记录当前到历史，随机选一首不同的
+                self._push_play_history()
+                if self._current_index < 0:
+                    self._current_index = random.randrange(len(self._songs))
+                else:
+                    candidates = [i for i in range(len(self._songs)) if i != self._current_index]
+                    self._current_index = random.choice(candidates)
+            else:
+                # 上一首：回退到历史（无历史则随机选一首不同的）
+                if self._play_history:
+                    self._current_index = self._play_history.pop()
+                else:
+                    candidates = [i for i in range(len(self._songs)) if i != self._current_index]
+                    self._current_index = random.choice(candidates) if candidates else 0
+        else:
+            # 顺序/单曲循环：手动切歌保持顺序（单曲循环只影响自然播放结束）
+            if self._current_index < 0:
+                # 尚未选择歌曲：下一首从第一首开始，上一首从最后一首开始
+                # （(-1 + -1) % n 会得到 n-2，直接取模是错的）
+                self._current_index = len(self._songs) - 1 if delta < 0 else 0
+            else:
+                self._current_index = (self._current_index + delta) % len(self._songs)
         self.songChanged.emit(self._current_index)
         self._position = 0.0
         self.positionChanged.emit(0.0)  # 立即刷新进度条，不必等下一次 250ms 定时器
@@ -1699,6 +1793,7 @@ class AudioPlayer(QObject):
             "lastFile": "",
             "lastPosition": 0.0,
             "sortMode": 0,
+            "playMode": 0,
             "musicDir": str(MUSIC_DIR),
             "rowSpacing": 48,
             "customFontFamily": "",
