@@ -1394,6 +1394,29 @@ class AudioPlayer(QObject):
             # "out"(暂停淡出) 与 "quit"(退出淡出) 都是淡出到 0
             pa_vol = int(self._volume / 100.0 * 65536 * (1.0 - t))
         gen = self._fade_generation
+        # pactl 上一个命令还在跑（如 AppImage 冷启动/系统繁忙导致 fork 变慢）时
+        # 跳过本步下发，避免 QProcess 堆积加重主线程负担；t 仍按步数推进，
+        # 最后一格（t=1）必然下发终点音量并收尾
+        if self._pactl_procs:
+            if t >= 1.0:
+                self._fade_timer.stop()
+                direction = self._fade_direction
+                self._fade_direction = None
+                self._fade_generation += 1
+                if direction == "quit":
+                    self._kill_process()
+                    if self._quit_callback:
+                        self._quit_callback()
+                elif direction == "out":
+                    try:
+                        os.kill(pid, signal.SIGSTOP)
+                    except OSError:
+                        pass
+                    self._pause_time = self._get_current_time()
+                    self._state = "paused"
+                    self.stateChanged.emit("paused")
+                    self._position_timer.stop()
+            return
         self._pa_set_volume(pid, pa_vol, gen)
         if t >= 1.0:
             self._fade_timer.stop()
@@ -1472,11 +1495,11 @@ class AudioPlayer(QObject):
             "-nodisp",
             "-autoexit",
         ]
-        # 终端启动时保留 ffplay 进度刷屏（期望的调试观感）；桌面启动时
-        # systemd 用户会话会把 stderr 接进 journal，ffplay 每 0.1s 一条
-        # 进度会把 journal 灌爆。非 tty 环境（journald/管道/重定向）加
-        # -nostats 关掉进度输出；错误信息仍正常输出（实测过）。
-        if not os.isatty(2):
+        # 一律加 -nostats 关闭 ffplay 每 0.1s 的进度刷屏：这条输出经
+        # QProcess 转发，在 AppImage 下会加重主线程/管道负担（实测位置
+        # 定时器被拖到 1.5s 一次）。错误信息不受影响。需要调试进度时可
+        # 设 PYMUSIC_FFPLAY_STATS=1 临时打开。
+        if os.environ.get("PYMUSIC_FFPLAY_STATS") != "1":
             args.append("-nostats")
         args += [
             "-volume", str(vol),
