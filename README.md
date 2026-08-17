@@ -1,7 +1,7 @@
 # 如仓库名字所见，这是一个完全由AI代理编写的软件
 （前景提要）
 
-我从Windows转到Linux后，我不喜欢Mpv和vlc的界面，也只想要一个好用的播放器，但是我很喜欢的播放器 [MusicPlayer2](https://github.com/zhongyang219/MusicPlayer2) 并不支持linux,所以我使用AI写了一个替代品
+我从Windows转到Linux后，我不喜欢Mpv和vlc的界面，也只想要一个好用的播放器，但是我很喜欢的播放器 [MusicPlayer2](https://github.com/zhongyang219/MusicPlayer2) 并不支持linux（我不想使用wine）,所以我使用AI写了一个替代品
 （注: 该播放器在Kde上的稳定性是可控的，Gnome和其他De/wm行为目前不可预测）
 
 
