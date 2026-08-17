@@ -37,6 +37,46 @@ _BUNDLED_BIN = Path(__file__).parent / "bin"
 if _BUNDLED_BIN.is_dir():
     os.environ["PATH"] = str(_BUNDLED_BIN) + os.pathsep + os.environ.get("PATH", "")
 
+# ========== 诊断日志 ==========
+# QSG_INFO=1：让 Qt 在启动时自行打印实际使用的场景图后端
+# （RHI/OpenGL/Software 等），用于排查 AppImage 下渲染性能问题。
+os.environ.setdefault("QSG_INFO", "1")
+# PYMUSIC_VERBOSE=1 时输出更详细的运行期日志（歌词索引变化等）
+_VERBOSE = os.environ.get("PYMUSIC_VERBOSE") == "1"
+
+
+def _log(tag, msg):
+    sys.stderr.write("[%s][%s] %s\n" % (time.strftime("%H:%M:%S"), tag, msg))
+    sys.stderr.flush()
+
+
+def _log_startup_diagnostics():
+    """启动诊断：版本/平台/渲染相关环境变量/捆绑工具版本"""
+    from PySide6.QtCore import qVersion
+    from PySide6.QtGui import QGuiApplication
+    _log("启动", "Python %s | PySide6/Qt %s | QPA 平台 %s"
+         % (sys.version.split()[0], qVersion(), QGuiApplication.platformName()))
+    _log("启动", "APPDIR=%s | 捆绑bin=%s"
+         % (os.environ.get("APPDIR", "(非AppImage)"),
+            str(_BUNDLED_BIN) if _BUNDLED_BIN.is_dir() else "(无)"))
+    _log("启动", "QT_QPA_PLATFORM=%s QT_QUICK_BACKEND=%s QSG_RENDER_LOOP=%s QT_SCALE_FACTOR=%s"
+         % (os.environ.get("QT_QPA_PLATFORM", "(默认)"),
+            os.environ.get("QT_QUICK_BACKEND", "(默认)"),
+            os.environ.get("QSG_RENDER_LOOP", "(默认)"),
+            os.environ.get("QT_SCALE_FACTOR", "(默认)")))
+    _log("启动", "PATH 前 300 字符: %s" % os.environ.get("PATH", "")[:300])
+
+    def _probe():
+        # 延后执行，避免阻塞启动；确认实际使用的 ffplay/ffmpeg 版本
+        for tool in ("ffplay", "ffmpeg", "ffprobe"):
+            try:
+                r = subprocess.run([tool, "-version"], capture_output=True, text=True, timeout=5)
+                first = r.stdout.splitlines()[0] if r.stdout else "(无输出)"
+                _log("探测", "%s: %s" % (tool, first))
+            except Exception as e:
+                _log("探测", "%s: 不可用 (%s)" % (tool, e))
+    QTimer.singleShot(1500, _probe)
+
 
 def _to_path(path_str):
     """Normalize a path string to a Path object with cross-platform support.
@@ -543,6 +583,13 @@ class AudioPlayer(QObject):
         self._position_timer = QTimer(self)
         self._position_timer.setInterval(250)
         self._position_timer.timeout.connect(self._update_position)
+
+        # 位置定时器滞后探针（诊断"高亮落后"是否为渲染/主线程繁忙导致）：
+        # 统计实际触发间隔超过期望值 250ms 的次数与累计滞后
+        self._timer_last_fire = 0.0
+        self._timer_slow_count = 0
+        self._timer_max_lag = 0.0
+        self._timer_lag_total = 0.0
 
         # 暂停/恢复的音量渐变（PA 平滑淡出淡入，250ms）
         self._fade_timer = QTimer(self)
@@ -1176,14 +1223,26 @@ class AudioPlayer(QObject):
                 except ValueError:
                     inputs = None
                 if inputs is not None:
+                    if _VERBOSE:
+                        _log("PA", "sink-inputs 共 %d 个，查找目标 pid=%s"
+                             % (len(inputs), pid))
                     for inp in inputs:
                         props = inp.get("properties", {})
-                        if props.get("application.process.id") == str(pid):
+                        ipid = props.get("application.process.id")
+                        if _VERBOSE:
+                            _log("PA", "  sink=%s name=%s pid=%s"
+                                 % (inp.get("index"), props.get("application.name"), ipid))
+                        if ipid == str(pid):
                             sink = inp["index"]
                             break
             if sink is None:
+                # pactl 失败或 sink 未注册：AppImage 下捆绑 ffplay 若未走
+                # PulseAudio（SDL 回退 ALSA），这里就永远找不到 → 淡入淡出失效
+                _log("PA", "pid=%s 未找到 sink-input (rc=%s) — 淡入淡出将走硬切换"
+                     % (pid, rc))
                 self._pa_available = None  # pactl 失败或 sink 未注册，下次重新探测
             else:
+                _log("PA", "pid=%s → sink=%s" % (pid, sink))
                 self._sink_id_cache[pid] = sink
             for cb in callbacks:
                 if cb:
@@ -1235,8 +1294,11 @@ class AudioPlayer(QObject):
                 return
             if gen is not None and gen != self._fade_generation:
                 return  # 淡出已被取消/替换，丢弃在途命令
-            self._run_pactl(["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
-                            lambda rc, out: None)
+            def on_set(rc, out):
+                if rc != 0:
+                    _log("淡出", "set-sink-input-volume 失败 rc=%s (sink=%s vol=%d)"
+                         % (rc, sink_id, pa_vol))
+            self._run_pactl(["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)], on_set)
 
         self._find_sink_input_id(pid, on_sink)
 
@@ -1295,11 +1357,13 @@ class AudioPlayer(QObject):
 
         def on_sink(sink_id):
             if sink_id is None:
+                _log("淡出", "方向=%s: sink 未找到，走硬切换（无淡入淡出）" % direction)
                 if on_done:
                     on_done(False)
                 return
             # 查找期间进程可能已被切换/停止，此时不应启动渐变
             if self._process is None or self._process.processId() != pid:
+                _log("淡出", "方向=%s: 查找期间进程已切换，放弃渐变" % direction)
                 if on_done:
                     on_done(False)
                 return
@@ -1307,6 +1371,7 @@ class AudioPlayer(QObject):
             self._fade_step = 0
             self._fade_total = max(1, round(duration_ms / self._fade_timer.interval()))
             self._fade_timer.start()
+            _log("淡出", "方向=%s 开始，%d 步" % (direction, self._fade_total))
             if on_done:
                 on_done(True)
 
@@ -1419,6 +1484,10 @@ class AudioPlayer(QObject):
             filepath,
         ]
         self._process.start("ffplay", args[1:])
+        # 记录实际使用的 ffplay 路径（AppImage 下应是捆绑的 bin/ffplay）
+        import shutil as _shutil
+        _ffp = _shutil.which("ffplay")
+        _log("播放", "启动 ffplay: %s (args: -ss %s)" % (_ffp or "?", seek_to))
         # 不调用 waitForStarted()：它会阻塞 GUI 线程最多 500ms，
         # 正是切歌时"轻微卡顿"的来源之一。进程启动交给事件循环处理，
         # PA 音量纠正本来就是异步重试，不受影响。
@@ -1505,6 +1574,21 @@ class AudioPlayer(QObject):
     def _update_position(self):
         """定时更新播放进度位置，触发信号通知 QML"""
         if self._state == "playing":
+            now = time.monotonic()
+            # 滞后探针：实际触发间隔显著超过 250ms 说明主线程被渲染/其他
+            # 工作阻塞，歌词索引与进度条更新都会跟着延后
+            if self._timer_last_fire:
+                gap_ms = (now - self._timer_last_fire) * 1000
+                lag = max(0.0, gap_ms - 250.0)
+                if lag > 100:
+                    self._timer_slow_count += 1
+                    self._timer_max_lag = max(self._timer_max_lag, lag)
+                    self._timer_lag_total += lag
+                    if self._timer_slow_count <= 5 or self._timer_slow_count % 20 == 0:
+                        _log("性能", "位置定时器滞后 %.0fms (实际间隔 %.0fms, 期望 250ms)"
+                             % (lag, gap_ms))
+            self._timer_last_fire = now
+
             elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
             # 时长未知（异步 ffprobe 还没返回）时先不 clamp，避免进度条卡在 0
             if self._duration > 0:
@@ -2071,6 +2155,10 @@ class AudioPlayer(QObject):
             else:
                 hi = mid - 1
         if idx != self._current_lyric_index:
+            if _VERBOSE:
+                _log("歌词", "索引 %d → %d @ pos=%.2fs (当前句时间 %.2fs)"
+                     % (self._current_lyric_index, idx, self._position,
+                        self._lyrics[idx][0] if 0 <= idx < len(self._lyrics) else -1))
             self._current_lyric_index = idx
             self.lyricIndexChanged.emit(idx)
 
@@ -2353,6 +2441,8 @@ def main():
     app.setApplicationName("MusicPlayer2 - Py")
     # 关闭主窗口时不退出程序，改为最小化到系统托盘
     app.setQuitOnLastWindowClosed(False)
+    # 启动诊断：版本/平台/渲染后端/捆绑工具（打印到 stderr）
+    _log_startup_diagnostics()
 
     # 让 Python 信号（Ctrl+C 等）在 Qt 事件循环空闲时也能及时投递。
     # 默认情况下 Python 信号处理器要等主线程执行到 Python 字节码才会运行，
@@ -2443,7 +2533,18 @@ def main():
 
     tray.activated.connect(on_tray_activated)
 
-    return app.exec()
+    rc = app.exec()
+
+    # 退出总结：位置定时器滞后统计（诊断"高亮落后"是否由渲染/主线程繁忙导致）
+    try:
+        if player._timer_slow_count:
+            _log("总结", "位置定时器慢触发 %d 次，累计滞后 %.0fms，最大单次 %.0fms"
+                 % (player._timer_slow_count, player._timer_lag_total, player._timer_max_lag))
+        else:
+            _log("总结", "位置定时器全程无滞后（≥100ms 的触发未出现）")
+    except Exception:
+        pass
+    return rc
 
 
 if __name__ == "__main__":
