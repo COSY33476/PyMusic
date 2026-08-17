@@ -1,3 +1,6 @@
+# 温馨提示：该程序内容全部由AI生成，本人只提供功能与想法（我不会PyThon与Qt）
+
+
 # PyMusic (MusicPlayer2 - Py)
 
 基于 **PySide6 + QML** 的 Linux 本地音乐播放器，内核使用 `ffplay`，支持网易云在线歌词/封面下载、双语歌词、模糊背景与无边框圆角界面。
