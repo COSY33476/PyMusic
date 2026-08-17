@@ -332,6 +332,33 @@ def parse_lrc(filepath):
         return []
 
 
+_LRC_TIME_RE = re.compile(r"\[(\d{1,3}):(\d{1,2}(?:\.\d{1,3})?)\]")
+
+
+def shift_lrc_text(text, delta):
+    """将 LRC 文本的所有 [mm:ss(.fff)] 时间戳整体平移 delta 秒（可正可负）。
+
+    保留原始行结构与小数位数；结果为负的时间戳钳制为 0。
+    """
+    def _repl(m):
+        mm = int(m.group(1))
+        sec_part = m.group(2)
+        if "." in sec_part:
+            ss_str, frac = sec_part.split(".")
+            frac_digits = len(frac)
+            total = mm * 60 + int(ss_str) + int(frac.ljust(3, "0")) / 1000.0
+            new = max(0.0, total + delta)
+            new_mm = int(new // 60)
+            new_ss = new - new_mm * 60
+            return "[%02d:%0*.*f]" % (new_mm, 3 + frac_digits, frac_digits, new_ss)
+        else:
+            total = mm * 60 + int(sec_part)
+            new = max(0, int(total + delta))
+            return "[%02d:%02d]" % (new // 60, new % 60)
+
+    return _LRC_TIME_RE.sub(_repl, text)
+
+
 def _is_inline_bilingual(text):
     """判断歌词行是否为"原文/译文"内联双语格式。
 
@@ -2234,17 +2261,21 @@ class AudioPlayer(QObject):
 
     # ========== 歌词相关 ==========
 
-    def _load_lyrics(self):
+    def _load_lyrics(self, clear_first=True):
         """加载当前歌曲的歌词（后台线程执行）。
 
         内嵌歌词需要跑 ffprobe（每次 50~200ms），旧实现在 GUI 线程同步
         调用，是切歌卡顿的主因之一。现在先立刻清空旧歌词（避免新歌显示
         上一首的歌词），再后台加载，完成后回填。
+
+        clear_first=False：不清空旧歌词直接重载（歌词时间戳调整后原地
+        刷新，避免视图先回顶部再跳回造成弹跳）。
         """
-        self._lyrics = []
-        self._current_lyric_index = -1
-        self.lyricsChanged.emit()
-        self.lyricIndexChanged.emit(-1)
+        if clear_first:
+            self._lyrics = []
+            self._current_lyric_index = -1
+            self.lyricsChanged.emit()
+            self.lyricIndexChanged.emit(-1)
         if 0 <= self._current_index < len(self._songs):
             song_path = self._songs[self._current_index]["path"]
             self._run_task(
@@ -2259,16 +2290,58 @@ class AudioPlayer(QObject):
             return parse_lrc(lrc_path)
         return extract_embedded_lyrics(song_path)
 
+    @Slot(float)
+    def shiftLyricTimestamps(self, delta):
+        """整体平移当前歌曲 LRC 文件的时间戳（每次点击 ±0.3s），
+        直接写回文件并立即重新加载刷新。
+
+        无外部 LRC（内嵌歌词）时：把当前歌词按新时间写出为 <歌曲名>.lrc。
+        """
+        if not (0 <= self._current_index < len(self._songs)):
+            return
+        song_path = self._songs[self._current_index]["path"]
+        song = _to_path(song_path)
+        lrc_path = find_matching_lyrics(song_path)
+        if lrc_path:
+            lrc_path = _to_path(lrc_path)
+            try:
+                text = lrc_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                _log_warn("歌词", "读取 LRC 失败: %s (%s)" % (lrc_path, e))
+                return
+        else:
+            # 内嵌歌词：从当前 _lyrics 生成 LRC（保留原文文本 + 新时间戳）
+            lines = []
+            for t, text_line, _raw in self._lyrics:
+                ts = max(0.0, t + delta)
+                mm = int(ts // 60)
+                ss = ts - mm * 60
+                lines.append("[%02d:%05.2f]%s" % (mm, ss, text_line))
+            text = "\n".join(lines) + "\n"
+            lrc_path = song.with_suffix(".lrc")
+        try:
+            lrc_path.write_text(shift_lrc_text(text, delta), encoding="utf-8")
+            _log("歌词", "时间戳 %+.1fs 已写入 %s" % (delta, lrc_path))
+        except OSError as e:
+            _log_warn("歌词", "写入 LRC 失败: %s (%s)" % (lrc_path, e))
+            return
+        # 立即重新加载刷新：不清空旧歌词（否则视图先回顶部再跳回，多次
+        # 调节会一直弹跳）；加载完成时按当前播放位置一次就位
+        self._load_lyrics(clear_first=False)
+
     def _on_lyrics_loaded(self, song_path, ok, lyrics):
         """歌词加载完成（GUI 线程）：仅当仍是当前歌曲时才应用，避免快速
         切歌时旧歌词错填到新歌上。"""
         if ok and 0 <= self._current_index < len(self._songs) \
                 and self._songs[self._current_index]["path"] == song_path:
             self._lyrics = lyrics or []
-            self._current_lyric_index = -1
-            _log("歌词", "加载完成: %d 行" % len(self._lyrics))
+            # 立即按当前播放位置计算索引：让 QML 的 rebuildGroups+snapAll
+            # 一次就位到当前行，避免"先回顶部再跳回"造成的弹跳
+            self._current_lyric_index = self._find_lyric_index(self._position)
+            _log("歌词", "加载完成: %d 行，当前行索引 %d"
+                 % (len(self._lyrics), self._current_lyric_index))
             self.lyricsChanged.emit()
-            self.lyricIndexChanged.emit(-1)
+            self.lyricIndexChanged.emit(self._current_lyric_index)
         elif not ok:
             _log_debug("歌词", "加载失败或被跳过: %s" % song_path)
 
@@ -2338,15 +2411,10 @@ class AudioPlayer(QObject):
                 return True
         return False
 
-    def _update_lyric_index(self):
-        """根据当前播放位置更新歌词索引（二分查找）"""
+    def _find_lyric_index(self, pos):
+        """二分查找最后一个 时间<=pos 的歌词行，无匹配返回 -1"""
         if not self._lyrics:
-            if self._current_lyric_index != -1:
-                self._current_lyric_index = -1
-                self.lyricIndexChanged.emit(-1)
-            return
-        # Binary search for the last lyric whose time <= current position
-        pos = self._position
+            return -1
         lo, hi = 0, len(self._lyrics) - 1
         idx = -1
         while lo <= hi:
@@ -2356,6 +2424,16 @@ class AudioPlayer(QObject):
                 lo = mid + 1
             else:
                 hi = mid - 1
+        return idx
+
+    def _update_lyric_index(self):
+        """根据当前播放位置更新歌词索引（二分查找）"""
+        if not self._lyrics:
+            if self._current_lyric_index != -1:
+                self._current_lyric_index = -1
+                self.lyricIndexChanged.emit(-1)
+            return
+        idx = self._find_lyric_index(self._position)
         if idx != self._current_lyric_index:
             if _VERBOSE:
                 _log("歌词", "索引 %d → %d @ pos=%.2fs (当前句时间 %.2fs)"

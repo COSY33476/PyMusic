@@ -125,6 +125,13 @@ ApplicationWindow {
     function toggleDownload() {
         downloadVisible = !downloadVisible
         console.log("[UI] 下载面板 " + (downloadVisible ? "打开" : "关闭"))
+        if (downloadVisible) {
+            // 打开面板时重置"用户手动编辑"标记并刷新预填：
+            // 否则用户编辑过一次后 _searchBoxEdited 永久为 true，
+            // 之后切歌时预填被跳过，搜索框不再跟随当前歌曲
+            window._searchBoxEdited = false
+            searchInput.text = player.currentSongName || ""
+        }
     }
 
     // 自动切换到歌词界面（播放键点击 + 歌曲列表点击）
@@ -1628,12 +1635,95 @@ ApplicationWindow {
                             Layout.preferredHeight: 48
                             color: "transparent"
 
-                            Text {
-                                font.family: window.uiFontFamily
+                            // 歌词标题 + 时间戳调节箭头：
+                            // 左箭头=时间戳提前 0.3s（变快），右箭头=延后 0.3s（变慢），
+                            // 直接写入 LRC 文件并立即刷新
+                            RowLayout {
                                 anchors.centerIn: parent
-                                text: "歌词"
-                                color: textSecondary
-                                font.pixelSize: 13
+                                spacing: 6
+
+                                Rectangle {
+                                    width: 24
+                                    height: 24
+                                    radius: 12
+                                    color: lyricFasterHover ? Qt.rgba(accent.r, accent.g, accent.b, 0.15) : "transparent"
+
+                                    property bool lyricFasterHover: false
+
+                                    Image {
+                                        id: lyricFasterIcon
+                                        anchors.centerIn: parent
+                                        width: 14
+                                        height: 14
+                                        source: "icons/left.svg"
+                                        sourceSize.width: 14
+                                        sourceSize.height: 14
+                                        visible: false
+                                    }
+                                    ColorOverlay {
+                                        anchors.fill: lyricFasterIcon
+                                        source: lyricFasterIcon
+                                        color: "#ffffff"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: player.shiftLyricTimestamps(-0.3)
+                                        onEntered: parent.lyricFasterHover = true
+                                        onExited: parent.lyricFasterHover = false
+                                    }
+                                    ToolTip {
+                                        visible: parent.lyricFasterHover
+                                        text: "歌词提前 0.3 秒（写入文件）"
+                                        delay: 500
+                                    }
+                                }
+
+                                Text {
+                                    font.family: window.uiFontFamily
+                                    text: "歌词"
+                                    color: "#ffffff"
+                                    font.pixelSize: 13
+                                }
+
+                                Rectangle {
+                                    width: 24
+                                    height: 24
+                                    radius: 12
+                                    color: lyricSlowerHover ? Qt.rgba(accent.r, accent.g, accent.b, 0.15) : "transparent"
+
+                                    property bool lyricSlowerHover: false
+
+                                    Image {
+                                        id: lyricSlowerIcon
+                                        anchors.centerIn: parent
+                                        width: 14
+                                        height: 14
+                                        source: "icons/Right.svg"
+                                        sourceSize.width: 14
+                                        sourceSize.height: 14
+                                        visible: false
+                                    }
+                                    ColorOverlay {
+                                        anchors.fill: lyricSlowerIcon
+                                        source: lyricSlowerIcon
+                                        color: "#ffffff"
+                                    }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: player.shiftLyricTimestamps(0.3)
+                                        onEntered: parent.lyricSlowerHover = true
+                                        onExited: parent.lyricSlowerHover = false
+                                    }
+                                    ToolTip {
+                                        visible: parent.lyricSlowerHover
+                                        text: "歌词延后 0.3 秒（写入文件）"
+                                        delay: 500
+                                    }
+                                }
                             }
                         }
 
