@@ -1,9 +1,27 @@
 '''网易云音乐 API 模块'''
 
+import logging
+import time
 import urllib.parse
 from pathlib import Path
 
 import requests
+
+# 复用 main.py 的日志体系（stderr + journald）。main.py 导入本模块时会
+# 调用 _setup_logging() 挂 handler；这里只做兜底（避免 "No handlers" 警告），
+# 不能在这里加 stderr handler——否则 main.py 的 _setup_logging 会误判
+# "已有 handler" 而跳过 journald 通道。
+_LOG = logging.getLogger("PyMusic")
+if not _LOG.handlers:
+    _LOG.addHandler(logging.NullHandler())
+
+
+def _api_log(msg):
+    _LOG.info("[API] %s", msg)
+
+
+def _api_warn(msg):
+    _LOG.warning("[API] %s", msg)
 
 
 _NETEASE_HEADERS = {
@@ -28,18 +46,21 @@ def search_netease(keywords, limit=10):
     """搜索歌曲，返回 [{id, name, ar, al}, ...]"""
     encoded = urllib.parse.quote(keywords)
     url = f"https://music.163.com/api/search/get/?s={encoded}&limit={limit}&type=1&offset=0"
+    t0 = time.time()
     try:
         resp = requests.post(url, headers=_NETEASE_HEADERS, timeout=10)
         data = resp.json()
     except (requests.RequestException, ValueError):
+        _api_warn("search '%s' 失败（网络/风控），耗时 %.0fms" % (keywords, (time.time() - t0) * 1000))
         # 网络错误或接口被风控返回非 JSON（HTML）时抛明确异常，
         # 由上层展示"搜索失败"而不是静默空列表
         raise NeteaseAPIError("网络异常或接口被限制") from None
     if data.get("code") != 200:
+        _api_warn("search '%s' code=%s" % (keywords, data.get("code")))
         raise NeteaseAPIError("网络异常或接口被限制")
-    # 注意 .get(key, default) 不防值为 null：result 为 null 时
-    # 需要 or {} 兜底，否则 None.get("songs") 会抛 AttributeError
-    return (data.get("result") or {}).get("songs") or []
+    songs = (data.get("result") or {}).get("songs") or []
+    _api_log("search '%s' → %d 条 (%.0fms)" % (keywords, len(songs), (time.time() - t0) * 1000))
+    return songs
 
 
 def _parse_lrc(lrc_text):
@@ -129,16 +150,21 @@ def get_netease_lyric(song_id):
     if not song_id or song_id <= 0:
         return None
     url = f"https://music.163.com/api/song/lyric?os=osx&id={song_id}&lv=-1&kv=-1&tv=-1"
+    t0 = time.time()
     try:
         resp = requests.get(url, headers=_NETEASE_HEADERS, timeout=10)
         data = resp.json()
     except (requests.RequestException, ValueError):
+        _api_warn("lyric id=%s 失败（网络/风控）" % song_id)
         return None
     if data.get("code") != 200:
+        _api_warn("lyric id=%s code=%s" % (song_id, data.get("code")))
         return None
     # .get(key, default) 不防值为 null，需要 or {} 兜底
     lrc_text = (data.get("lrc") or {}).get("lyric") or ""
     tlyric_text = (data.get("tlyric") or {}).get("lyric") or ""
+    _api_log("lyric id=%s → %d 字符%s (%.0fms)"
+             % (song_id, len(lrc_text), " +翻译" if tlyric_text else "", (time.time() - t0) * 1000))
     if tlyric_text:
         return _merge_bilingual_lyric(lrc_text, tlyric_text)
     return lrc_text or None
@@ -150,14 +176,19 @@ def get_netease_detail(song_id):
         return None
     encoded_id = urllib.parse.quote(f"[{song_id}]")
     url = f"https://music.163.com/api/song/detail/?id={song_id}&ids={encoded_id}&csrf_token="
+    t0 = time.time()
     try:
         resp = requests.get(url, headers=_NETEASE_HEADERS, timeout=10)
         data = resp.json()
     except (requests.RequestException, ValueError):
+        _api_warn("detail id=%s 失败（网络/风控）" % song_id)
         return None
     # songs 为 null 时 for 循环会抛 TypeError，需要 or [] 兜底
     for s in data.get("songs") or []:
-        return (s.get("album") or {}).get("picUrl") or ""
+        pic = (s.get("album") or {}).get("picUrl") or ""
+        _api_log("detail id=%s → 封面 %s (%.0fms)" % (song_id, "有" if pic else "无", (time.time() - t0) * 1000))
+        return pic
+    _api_log("detail id=%s → 无结果 (%.0fms)" % (song_id, (time.time() - t0) * 1000))
     return None
 
 
@@ -239,17 +270,20 @@ def save_lyric_file(song_id, save_path):
     """下载歌词并保存到文件，返回保存路径，失败返回 None"""
     lyric_text = get_netease_lyric(song_id)
     if not lyric_text:
+        _api_warn("save_lyric id=%s: 无歌词" % song_id)
         return None
     # 兜底：网易对无效 id 返回 "[00:00.00]暂无歌词" 占位文本，
     # 不能把占位内容存成 .lrc 文件
     lines = [l for l in lyric_text.split("\n") if l.strip()]
     if len(lines) == 1 and "暂无歌词" in lines[0]:
+        _api_warn("save_lyric id=%s: 网易占位歌词，跳过" % song_id)
         return None
     save_path = Path(save_path)
     lrc_path = save_path.with_suffix(".lrc")
     # 回退保护：已有歌词先备份为 .lrc.bak，防止误下载覆盖无法恢复
     _rotate_backup(lrc_path)
     lrc_path.write_text(lyric_text, encoding="utf-8")
+    _api_log("save_lyric id=%s → %s" % (song_id, lrc_path))
     return str(lrc_path)
 
 
@@ -258,6 +292,7 @@ def save_cover_file(song_id, pic_url, save_path):
     if not pic_url and song_id:
         pic_url = get_netease_detail(song_id)
     if not pic_url:
+        _api_warn("save_cover id=%s: 无封面 URL" % song_id)
         return None
     img_data = _fetch_cover_data(pic_url)
     save_path = Path(save_path)
@@ -283,4 +318,5 @@ def save_cover_file(song_id, pic_url, save_path):
             _rotate_backup(old_path)
     _rotate_backup(cover_path)
     cover_path.write_bytes(img_data)
+    _api_log("save_cover id=%s → %s (%d 字节)" % (song_id, cover_path, len(img_data)))
     return str(cover_path)

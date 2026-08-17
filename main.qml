@@ -108,6 +108,7 @@ ApplicationWindow {
 
     function toggleSettings() {
         settingsVisible = !settingsVisible
+        console.log("[UI] 设置面板 " + (settingsVisible ? "打开" : "关闭"))
     }
 
     // 颜色线性插值：t=0 → 精确 c1，t=1 → 精确 c2（含 alpha）
@@ -123,6 +124,7 @@ ApplicationWindow {
 
     function toggleDownload() {
         downloadVisible = !downloadVisible
+        console.log("[UI] 下载面板 " + (downloadVisible ? "打开" : "关闭"))
     }
 
     // 自动切换到歌词界面（播放键点击 + 歌曲列表点击）
@@ -620,7 +622,10 @@ ApplicationWindow {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         // X = 退出（300ms 音量淡出后退出，不走 closeToTray 的隐藏逻辑）
-                        onClicked: player.fadeOutQuit()
+                        onClicked: {
+                            console.log("[UI] 点击退出 (fadeOutQuit)")
+                            player.fadeOutQuit()
+                        }
                     }
                 }
             }
@@ -914,7 +919,10 @@ ApplicationWindow {
                                         anchors.fill: parent
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: player.listStyle = player.listStyle === 0 ? 1 : 0
+                                        onClicked: {
+                                            player.listStyle = player.listStyle === 0 ? 1 : 0
+                                            console.log("[UI] 视图切换 → " + (player.listStyle === 0 ? "列表" : "卡片"))
+                                        }
                                         onEntered: parent.styleBtnHovered = true
                                         onExited: parent.styleBtnHovered = false
                                     }
@@ -963,7 +971,10 @@ ApplicationWindow {
                                         anchors.fill: parent
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: player.sortMode = (player.sortMode + 1) % 4
+                                        onClicked: {
+                                            player.sortMode = (player.sortMode + 1) % 4
+                                            console.log("[UI] 排序模式 → " + player.sortMode)
+                                        }
                                         onEntered: parent.sortBtnHovered = true
                                         onExited: parent.sortBtnHovered = false
                                     }
@@ -2684,7 +2695,10 @@ ApplicationWindow {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             hoverEnabled: true
-                            onClicked: { player.playlistVisible = !player.playlistVisible }
+                                onClicked: {
+                                    player.playlistVisible = !player.playlistVisible
+                                    console.log("[UI] 播放列表 " + (player.playlistVisible ? "展开" : "收起"))
+                                }
                         }
 
                         ToolTip {
@@ -2728,7 +2742,10 @@ ApplicationWindow {
                                 id: prevBtnMouse
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: player.previous()
+                                onClicked: {
+                                    console.log("[UI] 上一首")
+                                    player.previous()
+                                }
                             }
                         }
 
@@ -2758,6 +2775,7 @@ ApplicationWindow {
                                         window.switchToLyric()
                                     }
                                     player.playPause()
+                                    console.log("[UI] 播放/暂停 → " + player.state)
                                 }
                             }
                         }
@@ -2792,7 +2810,10 @@ ApplicationWindow {
                                 id: nextBtnMouse
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
-                                onClicked: player.next()
+                                onClicked: {
+                                    console.log("[UI] 下一首")
+                                    player.next()
+                                }
                             }
                         }
                     }

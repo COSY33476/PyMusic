@@ -44,10 +44,87 @@ os.environ.setdefault("QSG_INFO", "1")
 # PYMUSIC_VERBOSE=1 时输出更详细的运行期日志（歌词索引变化等）
 _VERBOSE = os.environ.get("PYMUSIC_VERBOSE") == "1"
 
+import logging
+import logging.handlers
+import faulthandler
+
+# 日志通道：
+# 1) stderr（终端直接可见，现状保留）
+# 2) /dev/log → systemd journal（journalctl -t PyMusic 可查）
+_LOG = logging.getLogger("PyMusic")
+_LOG.setLevel(logging.DEBUG if _VERBOSE else logging.INFO)
+_LOG_FORMAT = "[%(asctime)s][%(levelname)s] %(message)s"
+_LOG_DATEFMT = "%H:%M:%S"
+_LOG_SETUP_DONE = False
+
+
+def _setup_logging():
+    global _LOG_SETUP_DONE
+    if _LOG_SETUP_DONE:
+        return
+    _LOG_SETUP_DONE = True
+    _sh = logging.StreamHandler(sys.stderr)
+    _sh.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATEFMT))
+    _LOG.addHandler(_sh)
+    try:
+        _jh = logging.handlers.SysLogHandler(
+            address="/dev/log",
+            facility=logging.handlers.SysLogHandler.LOG_USER,
+        )
+        # journald 按 syslog 报文"冒号前"解析 SYSLOG_IDENTIFIER，所以把
+        # "PyMusic: " 前缀放进 formatter（不用 SysLogHandler 的 ident 属性，
+        # 该属性拼接时不含冒号，journald 会回退成发送进程名 python3）
+        _jh.setFormatter(logging.Formatter("PyMusic: [%(levelname)s] %(message)s"))
+        _LOG.addHandler(_jh)
+    except Exception as e:
+        _LOG.warning("journald 不可用，仅记录到 stderr: %s", e)
+
 
 def _log(tag, msg):
-    sys.stderr.write("[%s][%s] %s\n" % (time.strftime("%H:%M:%S"), tag, msg))
-    sys.stderr.flush()
+    _LOG.info("[%s] %s", tag, msg)
+
+
+def _log_warn(tag, msg):
+    _LOG.warning("[%s] %s", tag, msg)
+
+
+def _log_debug(tag, msg):
+    _LOG.debug("[%s] %s", tag, msg)
+
+
+def _install_qt_msg_handler():
+    """把 Qt/QML 的 console.log 与 Qt 警告接入 logging（进 journal）。
+
+    QML 里 console.log() 走 QtDebugMsg；这里统一转发到 _LOG。
+    """
+    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
+
+    def _qt_handler(qtMsgType, context, message):
+        try:
+            msg = str(message)
+        except Exception:
+            msg = str(qtMsgType)
+        if qtMsgType == QtMsgType.QtWarningMsg:
+            _LOG.warning("[QML] %s", msg)
+        elif qtMsgType in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+            _LOG.error("[QML] %s", msg)
+        else:
+            _LOG.debug("[QML] %s", msg)
+
+    qInstallMessageHandler(_qt_handler)
+
+
+# ffplay stderr 噪音过滤：启动横幅 / 输入流信息 / 元数据（用户要求
+# 这些不要进日志和 journal），真正的错误（No such file 等）保留。
+_FFPLAY_NOISE_RE = re.compile(
+    r"^(ffplay version|built with|configuration:|libav[a-z0-9]+|"
+    r"Input #|Metadata:|Duration:|Stream #|"
+    r"\s{2,})"
+)
+
+
+def _is_ffplay_noise(line):
+    return bool(_FFPLAY_NOISE_RE.match(line))
 
 
 def _log_startup_diagnostics():
@@ -591,6 +668,33 @@ class AudioPlayer(QObject):
         self._timer_max_lag = 0.0
         self._timer_lag_total = 0.0
 
+        # 停滞转储：主线程卡住超阈值时 dump 主线程 Python 堆栈到日志
+        # （能直接看到卡在哪个调用上，如 QProcess/文件 IO/子进程等待）。
+        # SIGALRM 按阈值间隔重复触发，直到事件循环恢复。
+        # 阈值可用 PYMUSIC_STALL_DUMP_MS 调整（默认 800ms）。
+        # faulthandler 需要真实 fd：写入管道，由排水定时器转发到日志
+        try:
+            _stall_ms = float(os.environ.get("PYMUSIC_STALL_DUMP_MS", "800"))
+        except ValueError:
+            _stall_ms = 800.0
+        self._stall_threshold = _stall_ms / 1000.0
+        self._stall_rfd, self._stall_wfd = os.pipe()
+        # 读端必须非阻塞：排水定时器每次触发都 read，管道为空时若阻塞读
+        # 会把主线程/事件循环卡死（这是之前所有定时器全灭的根因）
+        os.set_blocking(self._stall_rfd, False)
+        os.set_inheritable(self._stall_wfd, False)
+        self._stall_wfile = os.fdopen(self._stall_wfd, "wb", buffering=0)
+        self._loop_last_tick = 0.0
+        self._watchdog_last_dump = 0.0
+        self._stall_drain = QTimer(self)
+        self._stall_drain.setInterval(200)
+        self._stall_drain.timeout.connect(self._drain_stall_pipe)
+        self._stall_drain.start()
+        # 看门狗线程：主线程停滞超阈值时 dump 所有线程堆栈。
+        # 不依赖 SIGALRM（实测 faulthandler.dump_traceback_later 的重复
+        # 转储在部分环境失效）。
+        threading.Thread(target=self._stall_watchdog, daemon=True).start()
+
         # 暂停/恢复的音量渐变（PA 平滑淡出淡入，250ms）
         self._fade_timer = QTimer(self)
         self._fade_timer.setInterval(30)
@@ -669,6 +773,43 @@ class AudioPlayer(QObject):
         self._start_metadata_enrichment()
 
     # ========== 歌曲信息查询 ==========
+
+    def _drain_stall_pipe(self):
+        """把停滞转储（看门狗线程写入管道）转发到日志"""
+        self._loop_last_tick = time.monotonic()
+        try:
+            data = os.read(self._stall_rfd, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            return
+        if data:
+            for line in data.decode("utf-8", "replace").splitlines():
+                if line.strip():
+                    _log("停滞", line)
+
+    def _stall_watchdog(self):
+        """看门狗线程：主线程事件循环停滞超阈值时转储主线程堆栈。"""
+        import traceback as _tb
+        while True:
+            time.sleep(0.2)
+            try:
+                now = time.monotonic()
+                if self._loop_last_tick and (now - self._loop_last_tick) > self._stall_threshold:
+                    if (now - self._watchdog_last_dump) > 2.0:
+                        self._watchdog_last_dump = now
+                        _log_warn("停滞", "检测到主线程停滞 %.0fms，主线程堆栈:"
+                                  % ((now - self._loop_last_tick) * 1000))
+                        # 从看门狗线程安全读取主线程的 Python 帧
+                        main_tid = threading.main_thread().ident
+                        frame = sys._current_frames().get(main_tid)
+                        if frame:
+                            for line in _tb.format_stack(frame):
+                                for l in line.rstrip("\n").split("\n"):
+                                    if l.strip():
+                                        _log("停滞", l)
+            except Exception:
+                pass
 
     @Slot(int, result=str)
     def songName(self, index):
@@ -1403,6 +1544,8 @@ class AudioPlayer(QObject):
                 direction = self._fade_direction
                 self._fade_direction = None
                 self._fade_generation += 1
+                _log("淡出", "方向=%s 完成（pactl 忙跳过，%d 步，用时 %.0fms）"
+                     % (direction, self._fade_step, self._fade_step * 30))
                 if direction == "quit":
                     self._kill_process()
                     if self._quit_callback:
@@ -1423,6 +1566,8 @@ class AudioPlayer(QObject):
             direction = self._fade_direction
             self._fade_direction = None
             self._fade_generation += 1  # 丢弃任何在途的过期命令
+            _log("淡出", "方向=%s 完成（%d 步，用时 %.0fms）"
+                 % (direction, self._fade_step, self._fade_step * 30))
             if direction == "quit":
                 # 退出淡出完成：音量已近 0，终止进程并触发退出回调
                 self._kill_process()
@@ -1479,7 +1624,9 @@ class AudioPlayer(QObject):
         """
         self._kill_process()
         self._process = QProcess()
-        self._process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
+        # 捕获 ffplay stderr 并过滤噪音（横幅/元数据不记录，错误进日志）
+        self._process.setProcessChannelMode(QProcess.SeparateChannels)
+        self._process.readyReadStandardError.connect(self._on_ffplay_stderr)
 
         if use_pa is None:
             use_pa = self._check_pa_available()
@@ -1537,6 +1684,7 @@ class AudioPlayer(QObject):
         self._seek_base = seek_to
         self._play_start_time = self._get_current_time()
         self._total_paused_duration = 0.0
+        self._timer_last_fire = 0.0  # 重置滞后基准（避免把暂停时长误计为滞后）
         self._position_timer.start()
 
     def _on_process_started(self):
@@ -1545,6 +1693,19 @@ class AudioPlayer(QObject):
             pid = self._process.processId()
             if pid > 0:
                 self._last_child_pid = pid
+
+    def _on_ffplay_stderr(self):
+        """转发 ffplay 的 stderr 到日志（过滤横幅/元数据噪音）"""
+        if not self._process:
+            return
+        data = bytes(self._process.readAllStandardError()).decode("utf-8", "replace")
+        for line in data.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _is_ffplay_noise(line):
+                continue
+            _log("ffplay", stripped)
 
     def _async_load_metadata(self, filepath):
         """后台线程加载歌曲时长（ffprobe），完成后在 GUI 线程回调。
@@ -1633,6 +1794,8 @@ class AudioPlayer(QObject):
         # 之前这里直接 return，UI 会永远停留在"播放中"而实际没有进程在放。
         # 改为转入 stopped 状态并通知 UI，让播放键回到可重新播放的状态。
         if exit_status != QProcess.NormalExit or exit_code != 0:
+            _log_warn("播放", "ffplay 异常退出 code=%s status=%s，转入 stopped"
+                      % (exit_code, exit_status))
             self._state = "stopped"
             self.stateChanged.emit("stopped")
             return
@@ -1673,6 +1836,7 @@ class AudioPlayer(QObject):
             self.positionChanged.emit(self._position)
 
         filepath = self._songs[self._current_index]["path"]
+        _log("播放", "play: idx=%d pos=%.2fs file=%s" % (self._current_index, self._position, filepath))
         self._start_ffplay(filepath, self._position)
         self._state = "playing"
         self.stateChanged.emit("playing")
@@ -1740,6 +1904,7 @@ class AudioPlayer(QObject):
                 self._start_fade("in")
         self._state = "playing"
         self.stateChanged.emit("playing")
+        self._timer_last_fire = 0.0  # 重置滞后基准（避免把暂停时长误计为滞后）
         self._position_timer.start()
 
         # 应用暂停期间累积但未生效的音量变更。
@@ -1778,6 +1943,7 @@ class AudioPlayer(QObject):
     @Slot()
     def stop(self):
         """停止播放并重置进度"""
+        _log("播放", "stop")
         self._kill_process()
         self._position_timer.stop()
         self._position = 0.0
@@ -2090,8 +2256,11 @@ class AudioPlayer(QObject):
                 and self._songs[self._current_index]["path"] == song_path:
             self._lyrics = lyrics or []
             self._current_lyric_index = -1
+            _log("歌词", "加载完成: %d 行" % len(self._lyrics))
             self.lyricsChanged.emit()
             self.lyricIndexChanged.emit(-1)
+        elif not ok:
+            _log_debug("歌词", "加载失败或被跳过: %s" % song_path)
 
     @Property(int, notify=lyricsChanged)
     def lyricCount(self):
@@ -2460,6 +2629,8 @@ def _acquire_single_instance(server):
 
 def main():
     """启动 PySide6 QML 应用"""
+    _setup_logging()
+    _install_qt_msg_handler()
     app = QApplication([])
     app.setApplicationName("MusicPlayer2 - Py")
     # 关闭主窗口时不退出程序，改为最小化到系统托盘
@@ -2555,6 +2726,34 @@ def main():
             show_window()
 
     tray.activated.connect(on_tray_activated)
+
+    # ===== 自测驱动（PYMUSIC_SELFTEST=1）：自动执行播放/暂停/恢复/seek/切歌/
+    # 调音量序列，用于在 AppImage 等环境复现"淡出/切歌瞬间主线程卡顿"并
+    # 由停滞转储（faulthandler）抓取阻塞点堆栈。 =====
+    if os.environ.get("PYMUSIC_SELFTEST") == "1":
+        def _selftest():
+            _log("自测", "开始: 播放→暂停→恢复→seek×3→切歌×2→调音量×3→退出淡出")
+            seq = [
+                (3.0, lambda: player.play()),
+                (8.0, lambda: player.seek(player.position + 20)),
+                (10.0, lambda: player.seek(player.position + 20)),
+                (12.0, lambda: player.pause()),
+                (15.0, lambda: player.resume()),
+                (17.0, lambda: player.setVolume(70)),
+                (19.0, lambda: player.seek(player.position + 15)),
+                (21.0, lambda: player.next()),
+                (23.0, lambda: player.setVolume(40)),
+                (25.0, lambda: player.pause()),
+                (28.0, lambda: player.resume()),
+                (30.0, lambda: player.next()),
+                (32.0, lambda: player.setVolume(60)),
+                (34.0, lambda: player.fadeOutQuit()),
+            ]
+            for delay, fn in seq:
+                QTimer.singleShot(int(delay * 1000), fn)
+            QTimer.singleShot(42000, app.quit)  # 兜底退出
+
+        QTimer.singleShot(2000, _selftest)
 
     rc = app.exec()
 
