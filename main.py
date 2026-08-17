@@ -37,6 +37,16 @@ _BUNDLED_BIN = Path(__file__).parent / "bin"
 if _BUNDLED_BIN.is_dir():
     os.environ["PATH"] = str(_BUNDLED_BIN) + os.pathsep + os.environ.get("PATH", "")
 
+# ========== 渲染循环 ==========
+# Wayland 下 AppImage 捆绑的 Qt 有时会自动探测/降级为 basic（单线程）
+# 场景图渲染循环——渲染完全挂在主线程事件循环里补帧，不再有独立线程
+# 按固定节拍推进动画，导致歌词高亮这类 Behavior/SpringAnimation 动画
+# 该刷新时刷不出来，攒到某个时刻才一次性跳变（表现为"卡在上一句，
+# 快播完才跳到当前句"）。X11 下同一份 AppImage 通常能拿到 threaded
+# 循环，所以只在 Wayland 复现。强制指定 threaded，让动画线程独立于
+# 主线程推进，不受 ffprobe/subprocess 等同步调用影响。
+os.environ.setdefault("QSG_RENDER_LOOP", "threaded")
+
 # ========== 诊断日志 ==========
 # QSG_INFO=1：让 Qt 在启动时自行打印实际使用的场景图后端
 # （RHI/OpenGL/Software 等），用于排查 AppImage 下渲染性能问题。
