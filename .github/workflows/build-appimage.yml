@@ -78,24 +78,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # 自定义版本名：提交信息以 "[tag: 名字]" 开头时使用该名字，
-          # 否则回退为 日期-短SHA。名字中的空白替换为 "-"（tag 不允许空格）。
-          SUBJECT="$(git log -1 --pretty=%s)"
-          CUSTOM="$(printf '%s' "$SUBJECT" | sed -n 's/^\[tag: \(.*\)\].*$/\1/p' | tr ' ' '-' | tr -d '~^:?*[]\\/')"
-          if [ -n "$CUSTOM" ]; then
-            VERSION="$CUSTOM"
-          else
-            VERSION="$(date +%Y%m%d)-${GITHUB_SHA::7}"
-          fi
+          # 版本名 = 提交日期 + 提交时间（如 20260817-153000，取自提交时间戳，
+          # 同一提交固定不变），每次构建使用独立 tag（= VERSION），
+          # 不同提交的 release 不会出现在同一个 tag 下。
+          RAW="$(git show -s --format=%ci ${GITHUB_SHA} | sed 's/[-: ]//g' | cut -c1-14)"
+          VERSION="${RAW:0:8}-${RAW:8:6}"
           ASSET="PyMusic-x86_64-${VERSION}.AppImage"
           cp PyMusic-x86_64.AppImage "$ASSET"
-          gh release create "新的提交-${VERSION}" "$ASSET" \
+          gh release create "${VERSION}" "$ASSET" \
             --prerelease \
-            --title "$VERSION" \
+            --title "${VERSION}" \
             --notes "由提交 ${GITHUB_SHA} 自动构建"
-          # 清理旧 release：保留最近 5 个，前缀与上面创建的 tag 一致
+          # 清理旧 release：保留最近 5 个（匹配 日期-时间 格式的 tag）
           gh release list --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("新的提交-"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
+            --jq '[.[] | select(.tagName | test("^[0-9]{8}-[0-9]{6}$"))] | sort_by(.createdAt) | reverse | .[5:] | .[].tagName' |
             while read -r tag; do
               gh release delete "$tag" --yes || true
             done
