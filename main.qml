@@ -4,6 +4,7 @@ import QtQuick.Layouts
 import Qt5Compat.GraphicalEffects
 import QtQuick.Dialogs
 import QtQuick.Window
+import QtQuick.Effects
 
 ApplicationWindow {
     id: window
@@ -54,29 +55,24 @@ ApplicationWindow {
     // 候选，不会报错也不会让现有的中文/英文显示变得更差。
     font.family: "Noto Sans CJK JP, Noto Sans CJK SC, Noto Sans, sans-serif"
 
-    // ========== 深色/亮色模式 ==========
+    // ========== 深色模式（固定深色，无亮色切换） ==========
     property bool darkMode: true
 
-    function toggleTheme() {
-        darkMode = !darkMode
-    }
-
-    // ========== 颜色主题（随 darkMode 切换） ==========
-    property color bgDark: darkMode ? (customDarkBg !== "" ? customDarkBg : "#1a1a2e") : (customLightBg !== "" ? customLightBg : "#f0f0f2")
-    property color bgPanel: darkMode ? "#16213e" : "#ffffff"
-    property color bgCard: darkMode ? "#0f3460" : "#e4e4e8"
+    // ========== 颜色主题（跟随深色背景 customDarkBg） ==========
+    property color bgDark: customDarkBg !== "" ? customDarkBg : "#1a1a2e"
+    property color bgPanel: "#16213e"
+    property color bgCard: "#0f3460"
     property color accent: customAccent !== "" ? customAccent : "#e94560"
     property color accentHover: "#ff6b81"
-    property color textPrimary: darkMode ? "#eaeaea" : "#1a1a2e"
-    property color textSecondary: darkMode ? "#8899aa" : "#666677"
-    property color textMuted: darkMode ? "#556677" : "#9999aa"
-    property color progressBg: darkMode ? "#2a2a4e" : "#d0d0d8"
+    property color textPrimary: "#eaeaea"
+    property color textSecondary: "#8899aa"
+    property color textMuted: "#556677"
+    property color progressBg: "#2a2a4e"
     property color progressFill: customAccent !== "" ? customAccent : "#e94560"
 
     // 自定义颜色（空字符串表示使用默认值）
     property string customAccent: ""
     property string customDarkBg: ""
-    property string customLightBg: ""
     property string customLyricColor: ""
     property string customLyricPlayedColor: ""
     property string customLyricUnplayedColor: ""
@@ -171,10 +167,8 @@ ApplicationWindow {
     }
 
     function saveAllSettings() {
-        saveSetting("darkMode", darkMode)
         saveSetting("customAccent", customAccent)
         saveSetting("customDarkBg", customDarkBg)
-        saveSetting("customLightBg", customLightBg)
         saveSetting("customLyricColor", customLyricColor)
         saveSetting("customLyricPlayedColor", customLyricPlayedColor)
         saveSetting("customLyricUnplayedColor", customLyricUnplayedColor)
@@ -195,10 +189,8 @@ ApplicationWindow {
     // 让整个界面回到上一次保存的状态。
     function reloadSettings() {
         var s = player.loadSettings()
-        if (s.darkMode !== undefined) darkMode = s.darkMode
         if (s.customAccent !== undefined) customAccent = s.customAccent
         if (s.customDarkBg !== undefined) customDarkBg = s.customDarkBg
-        if (s.customLightBg !== undefined) customLightBg = s.customLightBg
         if (s.customLyricColor !== undefined) customLyricColor = s.customLyricColor
         if (s.customLyricPlayedColor !== undefined) customLyricPlayedColor = s.customLyricPlayedColor
         if (s.customLyricUnplayedColor !== undefined) customLyricUnplayedColor = s.customLyricUnplayedColor
@@ -229,10 +221,8 @@ ApplicationWindow {
         function onSettingsRolledBack() { window.reloadSettings() }
     }
 
-    onDarkModeChanged: saveSetting("darkMode", darkMode)
     onCustomAccentChanged: saveSetting("customAccent", customAccent)
     onCustomDarkBgChanged: saveSetting("customDarkBg", customDarkBg)
-    onCustomLightBgChanged: saveSetting("customLightBg", customLightBg)
     onCustomLyricColorChanged: saveSetting("customLyricColor", customLyricColor)
     onCustomLyricPlayedColorChanged: saveSetting("customLyricPlayedColor", customLyricPlayedColor)
     onCustomLyricUnplayedColorChanged: saveSetting("customLyricUnplayedColor", customLyricUnplayedColor)
@@ -510,7 +500,7 @@ ApplicationWindow {
                 width: parent.width
                 height: 38
                 visible: titleBar.visible
-                color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+                color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, panelOpacity)
             }
 
             // 底栏底色（panelOpacity 驱动）：与顶栏同理放进蒙版层，
@@ -520,7 +510,7 @@ ApplicationWindow {
                 anchors.bottom: parent.bottom
                 width: parent.width
                 height: 72
-                color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+                color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, panelOpacity)
             }
         }
 
@@ -578,12 +568,20 @@ ApplicationWindow {
                     width: 34; height: 26; radius: 6
                     color: titleMinBtnMouse.containsPress ? accent : (titleMinBtnMouse.containsMouse ? Qt.rgba(1,1,1,0.12) : "transparent")
                     Behavior on color { ColorAnimation { duration: 100 } }
-                    Text {
+                    Image {
+                        id: titleMinIconImg
                         anchors.centerIn: parent
-                        text: "—"
+                        width: 14
+                        height: 14
+                        source: "icons/window-minimize.svg"
+                        sourceSize.width: 14
+                        sourceSize.height: 14
+                        visible: false
+                    }
+                    ColorOverlay {
+                        anchors.fill: titleMinIconImg
+                        source: titleMinIconImg
                         color: textPrimary
-                        font.family: window.uiFontFamily
-                        font.pixelSize: 13
                     }
                     MouseArea {
                         id: titleMinBtnMouse
@@ -601,12 +599,20 @@ ApplicationWindow {
                     width: 34; height: 26; radius: 6
                     color: titleCloseBtnMouse.containsPress ? accent : (titleCloseBtnMouse.containsMouse ? Qt.rgba(0.9, 0.2, 0.25, 0.75) : "transparent")
                     Behavior on color { ColorAnimation { duration: 100 } }
-                    Text {
+                    Image {
+                        id: titleCloseIconImg
                         anchors.centerIn: parent
-                        text: "✕"
+                        width: 13
+                        height: 13
+                        source: "icons/close.svg"
+                        sourceSize.width: 13
+                        sourceSize.height: 13
+                        visible: false
+                    }
+                    ColorOverlay {
+                        anchors.fill: titleCloseIconImg
+                        source: titleCloseIconImg
                         color: textPrimary
-                        font.family: window.uiFontFamily
-                        font.pixelSize: 12
                     }
                     MouseArea {
                         id: titleCloseBtnMouse
@@ -699,7 +705,7 @@ ApplicationWindow {
                     id: leftPanel
                     Layout.preferredWidth: playlistVisible ? parent.width * 0.38 : parent.width * 0.5
                     Layout.fillHeight: true
-                    color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+                    color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, panelOpacity)
                     clip: true
 
                     Behavior on Layout.preferredWidth {
@@ -739,12 +745,27 @@ ApplicationWindow {
                                     anchors.centerIn: parent
                                     spacing: 8
 
-                                    Text {
-                                        font.family: window.uiFontFamily
+                                    // 无封面占位音符图标
+                                    Item {
                                         Layout.alignment: Qt.AlignHCenter
-                                        text: "♫"
-                                        font.pixelSize: playlistVisible ? 64 : 80
-                                        color: textMuted
+                                        width: playlistVisible ? 64 : 80
+                                        height: playlistVisible ? 64 : 80
+
+                                        Image {
+                                            id: noCoverIconImg
+                                            anchors.centerIn: parent
+                                            width: parent.width
+                                            height: parent.height
+                                            source: "icons/music-note.svg"
+                                            sourceSize.width: parent.width
+                                            sourceSize.height: parent.height
+                                            visible: false
+                                        }
+                                        ColorOverlay {
+                                            anchors.fill: noCoverIconImg
+                                            source: noCoverIconImg
+                                            color: textMuted
+                                        }
                                     }
                                     Text {
                                         font.family: window.uiFontFamily
@@ -833,7 +854,7 @@ ApplicationWindow {
                     id: rightPanel
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    color: darkMode ? Qt.rgba(0.1, 0.1, 0.18, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+                    color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, panelOpacity)
                     clip: true
 
                     // ---- 播放列表（展开时显示） ----
@@ -846,7 +867,7 @@ ApplicationWindow {
                         Rectangle {
                             Layout.fillWidth: true
                             Layout.preferredHeight: 48
-                            color: darkMode ? Qt.rgba(0.09, 0.13, 0.24, panelOpacity) : Qt.rgba(1, 1, 1, panelOpacity)
+                            color: Qt.rgba(bgDark.r, bgDark.g, bgDark.b, panelOpacity)
 
                             RowLayout {
                                 anchors.fill: parent
@@ -861,6 +882,50 @@ ApplicationWindow {
                                     font.bold: true
                                 }
 
+                                // 列表/卡片样式切换
+                                Rectangle {
+                                    width: 28
+                                    height: 28
+                                    radius: 6
+                                    color: styleBtnHovered ? Qt.rgba(accent.r, accent.g, accent.b, 0.2) : "transparent"
+
+                                    property bool styleBtnHovered: false
+
+                                    // 卡片/列表视图切换图标：列表视图显示"网格"（切到卡片），
+                                    // 卡片视图显示"列表"（切回列表）
+                                    Image {
+                                        id: styleIconImg
+                                        anchors.centerIn: parent
+                                        width: 17
+                                        height: 17
+                                        source: player.listStyle === 0 ? "icons/grid.svg" : "icons/list.svg"
+                                        sourceSize.width: 17
+                                        sourceSize.height: 17
+                                        visible: false
+                                    }
+
+                                    ColorOverlay {
+                                        anchors.fill: styleIconImg
+                                        source: styleIconImg
+                                        color: textPrimary
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: player.listStyle = player.listStyle === 0 ? 1 : 0
+                                        onEntered: parent.styleBtnHovered = true
+                                        onExited: parent.styleBtnHovered = false
+                                    }
+
+                                    ToolTip {
+                                        visible: parent.styleBtnHovered
+                                        text: player.listStyle === 0 ? "切换为卡片视图" : "切换为列表视图"
+                                        delay: 500
+                                    }
+                                }
+
                                 // 排序按钮：循环切换 4 种排序模式
                                 Rectangle {
                                     width: 28
@@ -871,6 +936,7 @@ ApplicationWindow {
                                     property bool sortBtnHovered: false
 
                                     Image {
+                                        id: sortIconImg
                                         anchors.centerIn: parent
                                         width: 18
                                         height: 18
@@ -884,6 +950,13 @@ ApplicationWindow {
                                         }
                                         sourceSize.width: 18
                                         sourceSize.height: 18
+                                        visible: false
+                                    }
+
+                                    ColorOverlay {
+                                        anchors.fill: sortIconImg
+                                        source: sortIconImg
+                                        color: textPrimary
                                     }
 
                                     MouseArea {
@@ -914,7 +987,7 @@ ApplicationWindow {
                                         radius: 6
                                         // 底色透明：与面板融为一体，仅保留描边
                                         color: "transparent"
-                                        border.color: darkMode ? "#334466" : "#ccccd0"
+                                        border.color: "#334466"
                                         border.width: 1
                                     }
                                 }
@@ -933,33 +1006,33 @@ ApplicationWindow {
                             id: songListView
                             Layout.fillWidth: true
                             Layout.fillHeight: true
+                            visible: player.listStyle === 0
                             clip: true
                             model: player.songListModel
                             // 搜索过滤时禁用 currentIndex 跟随（过滤后列表位置与
                             // 完整列表索引不对应，高亮由 delegate 的 modelData.index 负责）
                             currentIndex: songSearchInput.text === "" ? player.currentIndex : -1
-                            boundsBehavior: Flickable.StopAtBounds
-                            flickDeceleration: 3000
+                            boundsBehavior: Flickable.DragAndOvershootBounds
+                            flickDeceleration: 2000
                             maximumFlickVelocity: 4000
                             ScrollBar.vertical: ScrollBar {
                                 policy: ScrollBar.AlwaysOn
                                 width: 12
 
                                 // 滑块主题跟随：颜色显式绑定 window.accent（含
-                                // customAccent 变化），轨道底色跟随 darkMode，
-                                // 且都带过渡动画——否则切换主题/强调色时只有
+                                // customAccent 变化），轨道底色跟随深色主题，
+                                // 且都带过渡动画——否则切换强调色时只有
                                 // 这里瞬间跳变或保持旧样式，与其余控件不同步。
                                 contentItem: Rectangle {
                                     implicitWidth: 12
                                     radius: 6
-                                    color: window.accent
-                                    opacity: 0.7
+                                    color: Qt.rgba(window.accent.r, window.accent.g, window.accent.b, 0.55)
                                     Behavior on color { ColorAnimation { duration: 150 } }
                                 }
                                 background: Rectangle {
                                     implicitWidth: 12
                                     radius: 6
-                                    color: darkMode ? Qt.rgba(1, 1, 1, 0.05) : Qt.rgba(0, 0, 0, 0.06)
+                                    color: Qt.rgba(1, 1, 1, 0.05)
                                     Behavior on color { ColorAnimation { duration: 150 } }
                                 }
                             }
@@ -980,6 +1053,26 @@ ApplicationWindow {
                             // 搜索激活（搜索框有文字）：居中占位失效，列表从顶部排列
                             property bool _searching: songSearchInput.text !== ""
 
+                            // ===== 滚轮速率自适应（滚得快→步长大、动画短，不被卡死） =====
+                            property real _wheelStep: 100      // 当前单格步长（px）
+                            property int _wheelLastTs: 0       // 上一滚轮事件时间戳
+                            property int _wheelStreak: 0       // 连续快速滚动的次数
+
+                            function _wheelRate() {
+                                var now = Date.now()
+                                var gap = now - songListView._wheelLastTs
+                                songListView._wheelLastTs = now
+                                if (gap < 120) {
+                                    songListView._wheelStreak = Math.min(songListView._wheelStreak + 1, 8)
+                                } else {
+                                    songListView._wheelStreak = 0
+                                }
+                                // 步长随连滚递增（1x → 4.2x），时长递减（150ms → 54ms）
+                                songListView._wheelStep = 100 * (1 + songListView._wheelStreak * 0.4)
+                                songListView._wheelDuration = Math.max(54, 150 - songListView._wheelStreak * 12)
+                            }
+                            property int _wheelDuration: 150
+
                             function _freeze() {
                                 songListView._frozenH = Math.max(0,
                                     songListView._centerOffset - songListView.currentIndex * songListView._itemHeight)
@@ -995,12 +1088,18 @@ ApplicationWindow {
                             }
 
                             onDraggingChanged: {
-                                if (dragging) songListView._freeze()
-                                else if (!flicking) songListResumeTimer.restart()
+                                if (dragging) {
+                                    listWheelScrollAnim.stop()
+                                    listFollowAnim.stop()
+                                    songListView._freeze()
+                                } else if (!flicking) songListResumeTimer.restart()
                             }
                             onFlickingChanged: {
-                                if (flicking) songListView._freeze()
-                                else if (!dragging) songListResumeTimer.restart()
+                                if (flicking) {
+                                    listWheelScrollAnim.stop()
+                                    listFollowAnim.stop()
+                                    songListView._freeze()
+                                } else if (!dragging) songListResumeTimer.restart()
                             }
 
                             Timer {
@@ -1019,7 +1118,19 @@ ApplicationWindow {
                                 }
                                 songListView._unfreeze()
                                 var targetY = songListView.currentIndex * songListView._itemHeight - songListView._centerOffset
-                                songListView.contentY = Math.max(0, targetY)
+                                // 平滑滚动到当前歌曲（不跳变）
+                                listFollowAnim.stop()
+                                listFollowAnim.to = Math.max(0, targetY)
+                                listFollowAnim.start()
+                            }
+
+                            // 切歌时平滑滚动到当前歌曲
+                            NumberAnimation {
+                                id: listFollowAnim
+                                target: songListView
+                                property: "contentY"
+                                duration: 260
+                                easing.type: Easing.OutCubic
                             }
 
                             headerPositioning: ListView.InlineHeader
@@ -1167,11 +1278,335 @@ ApplicationWindow {
                                     }
                                 }
                             }
+
+                            // 滚轮：手动驱动滚动并吞掉事件，保证：
+                            // 1) 滚轮只滚动、不触发全局滚轮音量；
+                            // 2) 滚到头/底时继续滚无事发生（不调音量）。
+                            // 3) 滚动带平滑动画（150ms OutCubic），不跳变。
+                            WheelHandler {
+                                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                onWheel: (event) => {
+                                    // 与拖拽一致：滚轮滚动视为用户手动滚动，
+                                    // 冻结 currentIndex 跟随，3 秒后自动恢复
+                                    songListView._freeze()
+                                    songListResumeTimer.restart()
+
+                                    songListView._wheelRate()
+                                    var maxY = Math.max(0, songListView.contentHeight - songListView.height)
+                                    var ny = songListView.contentY - event.angleDelta.y / 120 * songListView._wheelStep
+                                    ny = Math.max(0, Math.min(maxY, ny))
+                                    listWheelScrollAnim.stop()
+                                    listWheelScrollAnim.duration = songListView._wheelDuration
+                                    listWheelScrollAnim.to = ny
+                                    listWheelScrollAnim.start()
+                                    event.accepted = true
+                                }
+                            }
+
+                            // 滚轮逐格滚动动画（快速连续滚动时从当前位置继续）
+                            NumberAnimation {
+                                id: listWheelScrollAnim
+                                target: songListView
+                                property: "contentY"
+                                duration: 150
+                                easing.type: Easing.OutCubic
+                            }
                         }
-                    }
+
+                        // ===== 卡片网格视图（列表样式=1） =====
+                        // 卡片大小由设置 cardSize 控制；列数随宽度自适应，
+                        // 每行卡片整体居中（宽度不足以再多一列时均匀居中）
+                        Item {
+                            id: cardView
+                            Layout.fillWidth: true
+                            Layout.fillHeight: true
+                            visible: player.listStyle === 1
+                            clip: true
+
+                            property real cardGap: 12
+                            property real cell: player.cardSize + cardGap
+                            // 列数 = 能塞下的最大列数（至少 1）
+                            property int cols: Math.max(1, Math.floor((width + cardGap) / cell))
+                            // 行整体居中偏移（剩余宽度均匀分到两边）
+                            property real centerOffset: Math.max(0, (width - (cols * cell - cardGap)) / 2)
+                            // 内容总高
+                            property real contentHeight: Math.ceil(player.songListModel.length / cols) * cell - cardGap
+
+                            // ===== 滚轮速率自适应（同列表） =====
+                            property real _wheelStep: 150
+                            property int _wheelLastTs: 0
+                            property int _wheelStreak: 0
+                            property int _wheelDuration: 150
+
+                            function _wheelRate() {
+                                var now = Date.now()
+                                var gap = now - cardView._wheelLastTs
+                                cardView._wheelLastTs = now
+                                if (gap < 120) {
+                                    cardView._wheelStreak = Math.min(cardView._wheelStreak + 1, 8)
+                                } else {
+                                    cardView._wheelStreak = 0
+                                }
+                                cardView._wheelStep = Math.max(60, cardView.cell) * (1 + cardView._wheelStreak * 0.4)
+                                cardView._wheelDuration = Math.max(54, 150 - cardView._wheelStreak * 12)
+                            }
+
+                            Flickable {
+                                id: cardFlick
+                                anchors.fill: parent
+                                contentWidth: cardView.width
+                                contentHeight: cardView.contentHeight
+                                clip: true
+                                // 弹性过界 + 阻尼衰减：拖拽出界带阻力、松手弹簧回弹，
+                                // 惯性尾巴柔和（阻尼停下）
+                                boundsBehavior: Flickable.DragAndOvershootBounds
+                                flickDeceleration: 2000
+                                maximumFlickVelocity: 4000
+
+                                ScrollBar.vertical: ScrollBar {
+                                    policy: ScrollBar.AsNeeded
+                                    width: 8
+                                    contentItem: Rectangle {
+                                        implicitWidth: 8
+                                        radius: 4
+                                        color: Qt.rgba(window.accent.r, window.accent.g, window.accent.b, 0.55)
+                                    }
+                                    background: Rectangle {
+                                        implicitWidth: 8
+                                        radius: 4
+                                        color: "transparent"
+                                    }
+                                }
+
+                                Repeater {
+                                    model: player.songListModel
+
+                                    // 卡片：封面铺满 + 底部磨砂浮层(歌名/作者)
+                                    // 外层 Item 负责定位/悬停缩放/层级；卡片本体与
+                                    // 圆角遮罩作为兄弟节点（maskSource 不能是自身子项）
+                                    Item {
+                                        // 居中网格定位：x = 行内列偏移 + 整行居中，y = 行
+                                        property int colIdx: index % cardView.cols
+                                        property int rowIdx: Math.floor(index / cardView.cols)
+                                        x: cardView.centerOffset + colIdx * cardView.cell
+                                        y: rowIdx * cardView.cell
+                                        // 高度=cardSize（此前 cardSize+46 的标签区超出
+                                        // 行距 cell=cardSize+gap，会被下一行卡片盖住）
+                                        width: player.cardSize
+                                        height: player.cardSize
+
+                                        // 悬停放大 1.1x，并抬升到相邻卡片之上
+                                        scale: cardMouse.containsMouse ? 1.1 : 1.0
+                                        z: cardMouse.containsMouse ? 1 : 0
+                                        Behavior on scale {
+                                            NumberAnimation { duration: 500; easing.type: Easing.OutCubic }
+                                        }
+                                        transformOrigin: Item.Center
+
+                                        // 卡片本体
+                                        // 说明：原先用 Rectangle.clip + MultiEffect(maskSource: 独立
+                                        // 不可见 Rectangle cardMask，visible:false) 来裁圆角。问题在于
+                                        // Qt Quick 场景图对 visible: false 的节点会直接跳过渲染，不生成
+                                        // 任何纹理内容，导致 MultiEffect 采样到的 mask 全为透明
+                                        // （alpha=0），整个卡片（封面+文字）被当成完全透明裁掉——卡片
+                                        // 因此"消失"，但布局位置和 MouseArea 命中区域仍在，所以只能盲点。
+                                        //
+                                        // 修复：改用 Qt5Compat.GraphicalEffects 的 OpacityMask（本文件
+                                        // 顶部窗口整体圆角已用同样的手法验证过，在当前环境下稳定可用），
+                                        // mask 源节点始终 visible: true、真正参与渲染，不再依赖
+                                        // "看不见但要参与渲染"这种脆弱写法。
+                                        // 裁剪对象是"整张卡片内容"（封面 cardCover + 底部磨砂标签
+                                        // cardLabel 一起裁），这样即使封面图片铺满到卡片边缘、盖住了
+                                        // 卡片背景 Rectangle 的圆角，四角依然会被裁圆——图片本身的
+                                        // 四角像素也会被一起裁掉，不会再出现"图片方角盖住卡片圆角"的问题。
+                                        Rectangle {
+                                            id: cardItem
+                                            anchors.fill: parent
+                                            radius: 10
+                                            antialiasing: true
+                                            color: modelData.index === player.currentIndex
+                                                ? Qt.rgba(0.913, 0.271, 0.376, 0.18)
+                                                : "#16213e"
+                                            Behavior on color { ColorAnimation { duration: 120 } }
+
+                                            // 未裁剪前的原始内容（封面 + 标签），整体作为一个节点
+                                            // 渲染进离屏纹理，layer.effect 直接用 OpacityMask 采样
+                                            // cardMask 裁出圆角——写法与本文件顶部 rootSurface 的
+                                            // 整窗圆角（bgSurface + OpacityMask + rootMask）完全一致，
+                                            // 那里已验证在当前 Qt/驱动环境下稳定可用。
+                                            // 必须 visible: true，否则同样会被场景图跳过渲染，
+                                            // 变成本次要修复的"全透明"问题。
+                                            Item {
+                                                id: cardContent
+                                                anchors.fill: parent
+                                                visible: true
+                                                layer.enabled: true
+                                                layer.effect: OpacityMask {
+                                                    maskSource: cardMask
+                                                }
+
+                                                // 封面
+                                                Image {
+                                                    id: cardCover
+                                                    anchors.fill: parent
+                                                    fillMode: Image.PreserveAspectCrop
+                                                    source: modelData.image ? "file://" + modelData.image + "?c=" + window.coverStamp : ""
+                                                    asynchronous: false
+                                                    smooth: true
+
+                                                    // 无封面占位
+                                                    Rectangle {
+                                                        anchors.fill: parent
+                                                        visible: cardCover.status !== Image.Ready
+                                                        color: bgCard
+
+                                                        Item {
+                                                            anchors.centerIn: parent
+                                                            width: 28
+                                                            height: 28
+
+                                                            Image {
+                                                                id: cardNoCoverIcon
+                                                                anchors.fill: parent
+                                                                source: "icons/music-note.svg"
+                                                                sourceSize.width: 28
+                                                                sourceSize.height: 28
+                                                                visible: false
+                                                            }
+                                                            ColorOverlay {
+                                                                anchors.fill: cardNoCoverIcon
+                                                                source: cardNoCoverIcon
+                                                                color: textMuted
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // 底部磨砂玻璃标签区（在封面之上）
+                                                Item {
+                                                    id: cardLabel
+                                                    anchors.left: parent.left
+                                                    anchors.right: parent.right
+                                                    anchors.bottom: parent.bottom
+                                                    height: 40
+                                                    clip: true
+
+                                                    // 磨砂背景：模糊封面底部区域（layer 渲染 FastBlur 输出）
+                                                    Rectangle {
+                                                        anchors.fill: parent
+                                                        layer.enabled: true
+                                                        layer.effect: FastBlur {
+                                                            source: cardCover
+                                                            radius: 18
+                                                        }
+                                                    }
+                                                    // 半透明暗色：提高文字可读性（在磨砂之上）
+                                                    Rectangle {
+                                                        anchors.fill: parent
+                                                        color: Qt.rgba(0.04, 0.06, 0.09, 0.5)
+                                                    }
+
+                                                    // 歌名 / 作者
+                                                    ColumnLayout {
+                                                        anchors.left: parent.left
+                                                        anchors.right: parent.right
+                                                        anchors.verticalCenter: parent.verticalCenter
+                                                        anchors.leftMargin: 6
+                                                        anchors.rightMargin: 6
+                                                        spacing: 1
+
+                                                        Text {
+                                                            Layout.fillWidth: true
+                                                            font.family: window.uiFontFamily
+                                                            text: {
+                                                                var n = modelData.name || "未知"
+                                                                var i = n.lastIndexOf(" - ")
+                                                                return i > 0 ? n.slice(0, i) : n
+                                                            }
+                                                            color: "#f2f2f2"
+                                                            font.pixelSize: 11
+                                                            font.bold: true
+                                                            elide: Text.ElideRight
+                                                            maximumLineCount: 1
+                                                        }
+                                                        Text {
+                                                            Layout.fillWidth: true
+                                                            font.family: window.uiFontFamily
+                                                            text: {
+                                                                var n = modelData.name || ""
+                                                                var i = n.lastIndexOf(" - ")
+                                                                return i > 0 ? n.slice(i + 3) : ""
+                                                            }
+                                                            color: Qt.rgba(1, 1, 1, 0.7)
+                                                            font.pixelSize: 9
+                                                            elide: Text.ElideRight
+                                                            maximumLineCount: 1
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // 圆角遮罩源：始终 visible，与 cardContent 是兄弟节点，
+                                            // 场景图会为它生成真实纹理内容，供 OpacityMask 采样；
+                                            // 靠 z 值压到最底层、且被 cardContent（不透明）完全盖住，
+                                            // 实际不会单独露出来。
+                                            Rectangle {
+                                                id: cardMask
+                                                anchors.fill: parent
+                                                radius: 10
+                                                antialiasing: true
+                                                z: -1
+                                            }
+
+                                            MouseArea {
+                                                id: cardMouse
+                                                anchors.fill: parent
+                                                hoverEnabled: true
+                                                cursorShape: Qt.PointingHandCursor
+                                                onClicked: {
+                                                    player.currentIndex = modelData.index
+                                                    window.switchToLyric()
+                                                    player.play()
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 滚轮：手动驱动滚动并吞掉事件（同列表）：
+                                // 滚轮只滚动卡片网格，不触发全局滚轮音量；
+                                // 滚到头/底时继续滚无事发生；滚动带平滑动画；
+                                // 步长/时长随滚速自适应（滚得快→滚得快）。
+                                WheelHandler {
+                                    acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                                    onWheel: (event) => {
+                                        cardView._wheelRate()
+                                        var maxY = Math.max(0, cardFlick.contentHeight - cardFlick.height)
+                                        var ny = cardFlick.contentY - event.angleDelta.y / 120 * cardView._wheelStep
+                                        ny = Math.max(0, Math.min(maxY, ny))
+                                        cardWheelScrollAnim.stop()
+                                        cardWheelScrollAnim.duration = cardView._wheelDuration
+                                        cardWheelScrollAnim.to = ny
+                                        cardWheelScrollAnim.start()
+                                        event.accepted = true
+                                    }
+                                }
+
+                                // 卡片滚轮逐格滚动动画
+                                NumberAnimation {
+                                    id: cardWheelScrollAnim
+                                    target: cardFlick
+                                    property: "contentY"
+                                    duration: 150
+                                    easing.type: Easing.OutCubic
+                                }
+                            }
+                        }
+                        }
 
                     // ---- 歌词视图（折叠时显示） ----
                     ColumnLayout {
+                        id: lyricViewPanel
                         anchors.fill: parent
                         spacing: 0
                         visible: !playlistVisible
@@ -1330,11 +1765,11 @@ ApplicationWindow {
                                 (groupOf.length > player.currentLyricIndex && player.currentLyricIndex >= 0)
                                     ? groupOf[player.currentLyricIndex] : -1
 
-                            // ===== A 方案：大跨度跳转瞬间归位 =====
+                            // ===== 大跨度跳转：全局 600ms 平滑滑行 =====
                             // 逐组自然推进时 |Δ|≤1，保留弹簧错落手感；一次变化超过
-                            // 3 组说明是 seek/进度条 scrub 造成的大跳转——此时软弹簧
-                            // 追赶会让歌词堆瞬间坍缩叠成一团（实测最坏两行交叉
-                            // -376px），直接 snapAll 瞬间归位。
+                            // 3 组说明是 seek/进度条 scrub/恢复播放位置造成的大跳转——
+                            // 此时不再瞬间 snapAll 归位，而是整堆歌词 600ms 平移到
+                            // 目标位置（beginBigJumpGlide，见下方），避免跳变。
                             property int _lastSnapGroup: -1
                             onCurrentGroupIndexChanged: {
                                 var g = currentGroupIndex
@@ -1345,8 +1780,15 @@ ApplicationWindow {
                                 }
                                 // 从无歌词状态直接落到远处（如恢复上次播放位置）也算大跳
                                 var jump = _lastSnapGroup < 0 ? g : Math.abs(g - _lastSnapGroup)
-                                if (jump > 3)
-                                    Qt.callLater(snapAll)
+                                if (jump > 3) {
+                                    // 手动浏览歌词期间不做全局滑行（会跟手动偏移打架），
+                                    // 保持原 snapAll 瞬间行为
+                                    if (lyricView.manualScrolling) {
+                                        Qt.callLater(snapAll)
+                                    } else {
+                                        lyricView.beginBigJumpGlide()
+                                    }
+                                }
                                 _lastSnapGroup = g
                             }
 
@@ -1477,6 +1919,60 @@ ApplicationWindow {
                                 }
                             }
 
+                            // ===== 大跨度跳转（seek/恢复播放位置）的全局平移动画 =====
+                            // 之前用 snapAll 瞬间归位（避免逐行弹簧追赶时行交叉坍缩）。
+                            // 现在改为：先给全部行加一个统一位移 _bigJumpShift，让它们
+                            // 视觉上停在原地，再在 600ms 内把位移平滑归零——整堆歌词
+                            // 像整体平移一样滑到目标位置，既没有瞬间跳变，也不会出现
+                            // 逐行弹簧追赶导致的交叉。动画期间行处于"绑定直写"模式
+                            // （Behavior 关闭，snapAll 同款机制），位移由动画统一驱动。
+                            property real _bigJumpShift: 0
+
+                            NumberAnimation {
+                                id: bigJumpGlideAnim
+                                target: lyricView
+                                property: "_bigJumpShift"
+                                duration: 600
+                                easing.type: Easing.OutCubic
+                                onStopped: {
+                                    // 只有自然走完（位移已归零）才恢复逐行弹簧模式；
+                                    // 被 stop() 打断重启时位移仍非 0，跳过，由新的滑行动画接管
+                                    if (lyricView._bigJumpShift === 0) {
+                                        Qt.callLater(function() {
+                                            for (var i = 0; i < lyricRepeater.count; i++) {
+                                                var row = lyricRepeater.itemAt(i)
+                                                if (row) row.yBehaviorEnabled = true
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+
+                            // 大跳转：进入"全局滑行"流程（替代原先的瞬间 snapAll）
+                            function beginBigJumpGlide() {
+                                if (lyricRepeater.count === 0)
+                                    return
+                                bigJumpGlideAnim.stop()
+                                // 以第 0 行的当前位置为基准，计算需要补偿的位移：
+                                // 新的 targetY（含位移）必须等于行当前的视觉位置，
+                                // 才能让动画开始时整堆歌词纹丝不动
+                                var ref = lyricRepeater.itemAt(0)
+                                var oldY = ref ? ref.y : 0
+                                lyricView._bigJumpShift = oldY - lyricView.currentTargetBase(0)
+                                // 行进入"绑定直写"模式并同步到含位移的目标值
+                                for (var i = 0; i < lyricRepeater.count; i++) {
+                                    var row = lyricRepeater.itemAt(i)
+                                    if (row) {
+                                        row.yBehaviorEnabled = false
+                                        row._animY = row.targetY
+                                        row._animY = Qt.binding(lyricView.bindTargetY(row))
+                                    }
+                                }
+                                bigJumpGlideAnim.from = lyricView._bigJumpShift
+                                bigJumpGlideAnim.to = 0
+                                bigJumpGlideAnim.start()
+                            }
+
                             // 鼠标滚轮：手动浏览歌词，3 秒无操作后自动回到当前播放行。
                             // enabled 绑定歌词行数：没有歌词时（纯音乐）这个 handler
                             // 会白白吞掉滚轮事件（默认 blocking），导致根部的
@@ -1486,6 +1982,16 @@ ApplicationWindow {
                                 acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
                                 enabled: player.lyricCount > 0
                                 onWheel: (event) => {
+                                    // 大跳转滑行期间（行处于"绑定直写"模式）开始手动预览：
+                                    // 先结束滑行、恢复逐行弹簧，否则每格滚轮都会瞬间跳转
+                                    if (bigJumpGlideAnim.running) {
+                                        bigJumpGlideAnim.stop()
+                                        lyricView._bigJumpShift = 0
+                                        for (var g_i = 0; g_i < lyricRepeater.count; g_i++) {
+                                            var g_row = lyricRepeater.itemAt(g_i)
+                                            if (g_row) g_row.yBehaviorEnabled = true
+                                        }
+                                    }
                                     // 本次浏览会话开始时冻结自动滚动基准
                                     if (!lyricView.manualScrolling)
                                         lyricView.manualBaseIndex = player.currentLyricIndex
@@ -1507,8 +2013,8 @@ ApplicationWindow {
                                     height: lyricView.itemHeight
                                     x: 0
 
-                                    // 目标 y：基准位置 + 手动滚动偏移
-                                    property real targetY: lyricView.currentTargetBase(index) + lyricView.manualOffset
+                                    // 目标 y：基准位置 + 手动滚动偏移 + 大跳转全局位移
+                                    property real targetY: lyricView.currentTargetBase(index) + lyricView.manualOffset + lyricView._bigJumpShift
 
                                     // 这一行所在的组号 / 组内序号（组号相同 = 同一对原文/译文）。
                                     property int _groupIdx: lyricView.groupOf.length > index ? lyricView.groupOf[index] : index
@@ -1745,6 +2251,10 @@ ApplicationWindow {
                             }
 
                             function snapAll() {
+                                // 若大跳转滑行动画还在跑，先停掉并清零位移，
+                                // 避免与本次瞬间归位叠加造成偏移错位
+                                bigJumpGlideAnim.stop()
+                                lyricView._bigJumpShift = 0
                                 for (var i = 0; i < lyricRepeater.count; i++) {
                                     var row = lyricRepeater.itemAt(i)
                                     if (row) {
@@ -1850,6 +2360,14 @@ ApplicationWindow {
                                     }
                                 }
                             }
+                        }
+
+                        // 无歌词时吞掉歌词区滚轮，避免触发全局滚轮音量；
+                        // 有歌词时由歌词浏览 WheelHandler 接管（已 accept）。
+                        WheelHandler {
+                            acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                            enabled: player.lyricCount === 0
+                            onWheel: (event) => { event.accepted = true }
                         }
                     }
                 }
@@ -1961,12 +2479,20 @@ ApplicationWindow {
                         color: hideControlBackgrounds ? "transparent" : (settingsBtnMouse.containsPress ? accentHover : accent)
                         Behavior on color { ColorAnimation { duration: 100 } }
 
-                        Text {
-                            font.family: window.uiFontFamily
+                        Image {
+                            id: settingsIconImg
                             anchors.centerIn: parent
-                            text: "⚙"
-                            color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
-                            font.pixelSize: 18
+                            width: 20
+                            height: 20
+                            source: "icons/cog.svg"
+                            sourceSize.width: 20
+                            sourceSize.height: 20
+                            visible: false
+                        }
+                        ColorOverlay {
+                            anchors.fill: settingsIconImg
+                            source: settingsIconImg
+                            color: hideControlBackgrounds ? "#eaeaea" : "#fff"
                         }
 
                         MouseArea {
@@ -2007,7 +2533,7 @@ ApplicationWindow {
                         ColorOverlay {
                             anchors.fill: downloadIconImg
                             source: downloadIconImg
-                            color: window.darkMode ? "#ffffff" : "#000000"
+                            color: "#ffffff"
                         }
 
                         MouseArea {
@@ -2104,7 +2630,7 @@ ApplicationWindow {
                         ColorOverlay {
                             anchors.fill: playModeIconImg
                             source: playModeIconImg
-                            color: window.darkMode ? "#ffffff" : "#000000"
+                            color: "#ffffff"
                         }
 
                         MouseArea {
@@ -2137,12 +2663,20 @@ ApplicationWindow {
                         color: hideControlBackgrounds ? "transparent" : (toggleBtnMouse.containsPress ? accentHover : accent)
                         Behavior on color { ColorAnimation { duration: 100 } }
 
-                        Text {
-                            font.family: window.uiFontFamily
+                        Image {
+                            id: playlistToggleIconImg
                             anchors.centerIn: parent
-                            text: "☰"
-                            color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
-                            font.pixelSize: 18
+                            width: 20
+                            height: 20
+                            source: "icons/menu.svg"
+                            sourceSize.width: 20
+                            sourceSize.height: 20
+                            visible: false
+                        }
+                        ColorOverlay {
+                            anchors.fill: playlistToggleIconImg
+                            source: playlistToggleIconImg
+                            color: hideControlBackgrounds ? "#eaeaea" : "#fff"
                         }
 
                         MouseArea {
@@ -2187,7 +2721,7 @@ ApplicationWindow {
                             ColorOverlay {
                                 anchors.fill: prevIconImg
                                 source: prevIconImg
-                                color: window.darkMode ? "#ffffff" : "#000000"
+                                color: "#ffffff"
                             }
 
                             MouseArea {
@@ -2211,7 +2745,7 @@ ApplicationWindow {
                                 font.family: window.uiFontFamily
                                 anchors.centerIn: parent
                                 text: player.state === "playing" ? "⏸" : "▶"
-                                color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#fff"
+                                color: hideControlBackgrounds ? "#eaeaea" : "#fff"
                                 font.pixelSize: 20
                             }
 
@@ -2251,7 +2785,7 @@ ApplicationWindow {
                             ColorOverlay {
                                 anchors.fill: nextIconImg
                                 source: nextIconImg
-                                color: window.darkMode ? "#ffffff" : "#000000"
+                                color: "#ffffff"
                             }
 
                             MouseArea {
@@ -2263,51 +2797,11 @@ ApplicationWindow {
                         }
                     }
 
-                    // 右侧：主题切换 + 音量
+                    // 右侧：音量
                     RowLayout {
                         Layout.fillWidth: true
                         Layout.alignment: Qt.AlignRight
                         spacing: 8
-
-                        // 主题切换按钮
-                        Rectangle {
-                            id: themeBtn
-                            width: 36
-                            height: 36
-                            radius: 18
-                            color: hideControlBackgrounds ? "transparent" : (themeBtnMouse.containsPress ? accentHover : accent)
-                            Behavior on color { ColorAnimation { duration: 100 } }
-
-                            Image {
-                                id: themeIconImg
-                                anchors.centerIn: parent
-                                width: 20
-                                height: 20
-                                source: window.darkMode ? "icons/Moon.svg" : "icons/SUN.svg"
-                                sourceSize.width: 20
-                                sourceSize.height: 20
-                                visible: false
-                            }
-
-                            ColorOverlay {
-                                anchors.fill: themeIconImg
-                                source: themeIconImg
-                                color: window.darkMode ? "#ffffff" : "#000000"
-                            }
-
-                            MouseArea {
-                                id: themeBtnMouse
-                                anchors.fill: parent
-                                cursorShape: Qt.PointingHandCursor
-                                onClicked: window.toggleTheme()
-                            }
-
-                            ToolTip {
-                                visible: themeBtnMouse.containsMouse
-                                text: window.darkMode ? "切换亮色模式" : "切换深色模式"
-                                delay: 500
-                            }
-                        }
 
                         // 音量滑块
                         RowLayout {
@@ -2329,7 +2823,7 @@ ApplicationWindow {
                                 Layout.preferredWidth: volumeIconImg.width
                                 Layout.preferredHeight: volumeIconImg.height
                                 source: volumeIconImg
-                                color: hideControlBackgrounds ? (darkMode ? "#eaeaea" : "#1a1a2e") : "#ffffff"
+                                color: hideControlBackgrounds ? "#eaeaea" : "#ffffff"
                             }
 
                             Slider {
@@ -2347,13 +2841,13 @@ ApplicationWindow {
                                     width: volumeSlider.availableWidth
                                     height: 4
                                     radius: 2
-                                    color: progressBg
+                                    color: Qt.rgba(progressBg.r, progressBg.g, progressBg.b, 0.45)
 
                                     Rectangle {
                                         width: volumeSlider.visualPosition * parent.width
                                         height: parent.height
                                         radius: 2
-                                        color: accent
+                                        color: Qt.rgba(accent.r, accent.g, accent.b, 0.6)
                                     }
                                 }
 
@@ -2363,8 +2857,12 @@ ApplicationWindow {
                                     width: 14
                                     height: 14
                                     radius: 7
-                                    color: volumeSlider.pressed ? accentHover : (hideControlBackgrounds ? accent : "#ffffff")
-                                    border.color: accent
+                                    color: volumeSlider.pressed
+                                        ? Qt.rgba(accentHover.r, accentHover.g, accentHover.b, 0.85)
+                                        : (hideControlBackgrounds
+                                            ? Qt.rgba(accent.r, accent.g, accent.b, 0.85)
+                                            : Qt.rgba(1, 1, 1, 0.85))
+                                    border.color: Qt.rgba(accent.r, accent.g, accent.b, 0.8)
                                     border.width: 2
                                     Behavior on color { ColorAnimation { duration: 100 } }
                                 }
@@ -2391,16 +2889,14 @@ ApplicationWindow {
                                     interval: 60
                                     repeat: false
                                     property real pendingValue: volumeSlider.value
-                                    onTriggered: player.volume = pendingValue
-                                }
-                            }
-                        }
+                                     onTriggered: player.volume = pendingValue
+                                 }
+                             }
+                         }
 
                     }
                 }
             }
-
-            
         }
     }
 
@@ -2445,7 +2941,8 @@ ApplicationWindow {
                 contentWidth: width
                 contentHeight: settingsColumn.implicitHeight
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragAndOvershootBounds
+                flickDeceleration: 2000
                 flickableDirection: Flickable.VerticalFlick
                 interactive: true
 
@@ -2455,8 +2952,7 @@ ApplicationWindow {
                     contentItem: Rectangle {
                         implicitWidth: 6
                         radius: 3
-                        color: accent
-                        opacity: 0.6
+                        color: Qt.rgba(accent.r, accent.g, accent.b, 0.55)
                     }
                     background: Rectangle {
                         implicitWidth: 6
@@ -2500,9 +2996,9 @@ ApplicationWindow {
                     property bool _invalid: false
 
                     background: Rectangle {
-                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#1a1a3e" : "#e8e8ec")
+                        color: customBtnBg !== "" ? customBtnBg : "#1a1a3e"
                         radius: 6
-                        border.color: musicDirInput._invalid ? "#e94560" : (darkMode ? "#334466" : "#ccccd0")
+                        border.color: musicDirInput._invalid ? "#e94560" : ("#334466")
                     }
 
                     Timer {
@@ -2522,7 +3018,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 6
                         }
                         contentItem: Text {
@@ -2612,7 +3108,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2632,7 +3128,7 @@ ApplicationWindow {
 
                     Text {
                         font.family: window.uiFontFamily
-                        text: "深色背景"
+                        text: "背景色"
                         color: textPrimary
                         font.pixelSize: 12
                         Layout.preferredWidth: 60
@@ -2656,51 +3152,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
-                            radius: 4
-                        }
-                        contentItem: Text {
-                            text: parent.text
-                            color: textPrimary
-                            font: parent.font
-                            horizontalAlignment: Text.AlignHCenter
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                    }
-                }
-
-                // 亮色背景
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: 10
-
-                    Text {
-                        font.family: window.uiFontFamily
-                        text: "亮色背景"
-                        color: textPrimary
-                        font.pixelSize: 12
-                        Layout.preferredWidth: 60
-                    }
-
-                    Rectangle {
-                        width: 20; height: 20; radius: 4
-                        color: customLightBg !== "" ? customLightBg : "#f0f0f2"
-                        border.color: textMuted
-                        border.width: 1
-                    }
-
-                    Item { Layout.fillWidth: true }
-
-                    Button {
-                        text: "选择"
-                        font.pixelSize: 11
-                        onClicked: {
-                            openColorDialog("customLightBg", customLightBg !== "" ? customLightBg : "#f0f0f2")
-                        }
-                        background: Rectangle {
-                            implicitWidth: 52
-                            implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2728,7 +3180,7 @@ ApplicationWindow {
 
                     Rectangle {
                         width: 20; height: 20; radius: 4
-                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                         border.color: textMuted
                         border.width: 1
                     }
@@ -2739,12 +3191,12 @@ ApplicationWindow {
                         text: "选择"
                         font.pixelSize: 11
                         onClicked: {
-                            openColorDialog("customBtnBg", customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc"))
+                            openColorDialog("customBtnBg", customBtnBg !== "" ? customBtnBg : "#2a2a4e")
                         }
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2804,7 +3256,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2847,7 +3299,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2890,7 +3342,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -2920,7 +3372,7 @@ ApplicationWindow {
 
                     Rectangle {
                         width: 40; height: 22; radius: 11
-                        color: hideControlBackgrounds ? accent : (darkMode ? "#3a3a5e" : "#c0c0c8")
+                        color: hideControlBackgrounds ? accent : "#3a3a5e"
                         Behavior on color { ColorAnimation { duration: 150 } }
 
                         Rectangle {
@@ -3078,7 +3530,6 @@ ApplicationWindow {
                     onClicked: {
                         customAccent = ""
                         customDarkBg = ""
-                        customLightBg = ""
                         customLyricColor = ""
                         customLyricPlayedColor = ""
                         customLyricUnplayedColor = ""
@@ -3088,7 +3539,7 @@ ApplicationWindow {
                     background: Rectangle {
                         implicitWidth: 52
                         implicitHeight: 28
-                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                         radius: 4
                     }
                     contentItem: Text {
@@ -3174,6 +3625,63 @@ ApplicationWindow {
                     }
                 }
 
+                // 卡片大小（卡片网格视图）
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "卡片大小"
+                        color: textPrimary
+                        font.pixelSize: 12
+                        Layout.preferredWidth: 60
+                    }
+
+                    Slider {
+                        id: cardSizeSlider
+                        from: 90
+                        to: 220
+                        stepSize: 10
+                        value: player.cardSize
+                        Layout.fillWidth: true
+                        onValueChanged: player.cardSize = value
+                        background: Rectangle {
+                            x: cardSizeSlider.leftPadding
+                            y: cardSizeSlider.topPadding + cardSizeSlider.availableHeight / 2 - height / 2
+                            implicitWidth: 200
+                            implicitHeight: 4
+                            width: cardSizeSlider.availableWidth
+                            height: implicitHeight
+                            radius: 2
+                            color: progressBg
+                            Rectangle {
+                                width: cardSizeSlider.visualPosition * parent.width
+                                height: parent.height
+                                color: accent
+                                radius: 2
+                            }
+                        }
+                        handle: Rectangle {
+                            x: cardSizeSlider.leftPadding + cardSizeSlider.visualPosition * (cardSizeSlider.availableWidth - width)
+                            y: cardSizeSlider.topPadding + cardSizeSlider.availableHeight / 2 - height / 2
+                            implicitWidth: 14
+                            implicitHeight: 14
+                            radius: 7
+                            color: accent
+                        }
+                    }
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: player.cardSize + "px"
+                        color: textSecondary
+                        font.pixelSize: 12
+                        Layout.preferredWidth: 44
+                        horizontalAlignment: Text.AlignRight
+                    }
+                }
+
                 // ===== 全局字体 =====
                 // 之前 window.font.family 写的是一串逗号分隔的候选列表
                 // （"Noto Sans CJK SC, Noto Sans CJK JP, Noto Sans, sans-serif"），
@@ -3238,9 +3746,9 @@ ApplicationWindow {
                             if (!activeFocus) applyIfChanged()
                         }
                         background: Rectangle {
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#1a1a3e" : "#e8e8ec")
+                            color: customBtnBg !== "" ? customBtnBg : "#1a1a3e"
                             radius: 6
-                            border.color: darkMode ? "#334466" : "#ccccd0"
+                            border.color: "#334466"
                         }
                     }
 
@@ -3251,7 +3759,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 4
                         }
                         contentItem: Text {
@@ -3273,7 +3781,7 @@ ApplicationWindow {
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
-                            color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                             radius: 6
                         }
                         contentItem: Text {
@@ -3312,7 +3820,7 @@ ApplicationWindow {
 
                     Rectangle {
                         width: 40; height: 22; radius: 11
-                        color: autoSwitchToLyric ? accent : (darkMode ? "#3a3a5e" : "#c0c0c8")
+                        color: autoSwitchToLyric ? accent : "#3a3a5e"
                         Behavior on color { ColorAnimation { duration: 150 } }
 
                         Rectangle {
@@ -3347,7 +3855,7 @@ ApplicationWindow {
 
                     Rectangle {
                         width: 40; height: 22; radius: 11
-                        color: closeToTray ? accent : (darkMode ? "#3a3a5e" : "#c0c0c8")
+                        color: closeToTray ? accent : "#3a3a5e"
                         Behavior on color { ColorAnimation { duration: 150 } }
 
                         Rectangle {
@@ -3380,7 +3888,7 @@ ApplicationWindow {
                     background: Rectangle {
                         implicitWidth: 52
                         implicitHeight: 28
-                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                         radius: 4
                     }
                     contentItem: Text {
@@ -3461,8 +3969,8 @@ ApplicationWindow {
                         Layout.fillWidth: true
                         height: 36
                         radius: 6
-                        color: darkMode ? "#2a2a4e" : "#e0e0e4"
-                        border.color: darkMode ? "#3a3a5e" : "#c0c0c8"
+                        color: "#2a2a4e"
+                        border.color: "#3a3a5e"
                         border.width: 1
 
                         TextInput {
@@ -3518,13 +4026,14 @@ ApplicationWindow {
                     Layout.fillHeight: true
                     clip: true
                     spacing: 8
+                    flickDeceleration: 2000
                     model: player.searchResultModel
 
                     delegate: Rectangle {
                         width: ListView.view.width
                         height: 72
                         radius: 8
-                        color: darkMode ? "#1a2a4e" : "#e8e8ec"
+                        color: "#1a2a4e"
 
                         RowLayout {
                             anchors.fill: parent
@@ -3701,7 +4210,6 @@ ApplicationWindow {
             switch (colorDialogTarget) {
                 case "customAccent": customAccent = selectedColor; break
                 case "customDarkBg": customDarkBg = selectedColor; break
-                case "customLightBg": customLightBg = selectedColor; break
                 case "customLyricColor": customLyricColor = selectedColor; break
                 case "customLyricPlayedColor": customLyricPlayedColor = selectedColor; break
                 case "customLyricUnplayedColor": customLyricUnplayedColor = selectedColor; break
@@ -3760,9 +4268,9 @@ ApplicationWindow {
                 color: textPrimary
                 font.pixelSize: 12
                 background: Rectangle {
-                    color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#1a1a3e" : "#e8e8ec")
+                    color: customBtnBg !== "" ? customBtnBg : "#1a1a3e"
                     radius: 6
-                    border.color: darkMode ? "#334466" : "#ccccd0"
+                    border.color: "#334466"
                 }
             }
 
@@ -3771,7 +4279,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                boundsBehavior: Flickable.StopAtBounds
+                boundsBehavior: Flickable.DragAndOvershootBounds
+                flickDeceleration: 2000
 
                 property var _filtered: {
                     var raw = fontDialog.allFonts
@@ -3820,8 +4329,7 @@ ApplicationWindow {
                     contentItem: Rectangle {
                         implicitWidth: 6
                         radius: 3
-                        color: accent
-                        opacity: 0.6
+                        color: Qt.rgba(accent.r, accent.g, accent.b, 0.55)
                     }
                 }
             }
@@ -3837,7 +4345,7 @@ ApplicationWindow {
                     background: Rectangle {
                         implicitWidth: 60
                         implicitHeight: 28
-                        color: customBtnBg !== "" ? customBtnBg : (darkMode ? "#2a2a4e" : "#d8d8dc")
+                        color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
                         radius: 6
                     }
                     contentItem: Text {
@@ -3856,7 +4364,7 @@ ApplicationWindow {
                     background: Rectangle {
                         implicitWidth: 60
                         implicitHeight: 28
-                        color: enabled ? accent : (darkMode ? "#3a3a5e" : "#c0c0c8")
+                        color: enabled ? accent : "#3a3a5e"
                         radius: 6
                     }
                     contentItem: Text {
@@ -3901,45 +4409,28 @@ ApplicationWindow {
         onTriggered: downloadOverlay.visible = false
     }
 
-    // ========== 全局鼠标滚轮音量调节 ==========
-    // 挂在窗口根级、铺满整个窗口，且放在最后声明，保证 z 顺序在最上层，
-    // 才能在鼠标位于窗口任意位置时都能捕获滚轮事件。
-    // 使用 WheelHandler 而不是 MouseArea：WheelHandler 只处理滚轮事件，
-    // 不会拦截/吞掉鼠标点击、拖动等事件，也完全不需要窗口或子控件获得焦点，
-    // 不会影响播放列表、按钮等其他控件原有的点击/拖拽交互。
+    // ========== 全局鼠标滚轮音量调节（非滚动区生效） ==========
+    // 挂在窗口根级（最后声明=最上层），鼠标在窗口任意位置都能捕获滚轮。
+    // 可滚动视图（曲目列表/卡片/歌词）内部各自挂有"手动滚动+吞事件"的
+    // WheelHandler，会把该区域内的滚轮事件全部拦截，根级处理器收不到，
+    // 因此这些区域滚轮只滚动、不调音量；其余区域（底部控制栏、标题栏、
+    // 左侧封面等）的滚轮事件才会到达这里调节音量。
     WheelHandler {
-        target: null  // 不需要对某个 Item 做视觉操作，只是监听事件
+        target: null
         acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
 
         onWheel: (event) => {
-            // 设置面板或下载面板打开时，不拦截滚轮事件，让子级控件
-            //（如 Flickable）正常滚动，避免滚动设置项时误调音量。
+            // 设置面板或下载面板打开时放行，让子级滚动/输入正常
             if (settingsVisible || downloadVisible) {
                 event.accepted = false
                 return
             }
 
-            // 每次滚动一格通常对应 120（或其整数倍/分数），换算成音量步进；
-            // 一格滚动 = 音量变化 5，可根据手感调整这个系数。
             var steps = event.angleDelta.y / 120
-
-            // 关键点：必须在 wheelVolumeTimer.pendingValue（本次防抖窗口内
-            // 已经累积的目标音量）基础上累加，而不能用 player.volume 累加。
-            // 因为防抖计时器触发前 player.volume 还没被真正更新，如果这里
-            // 用 player.volume 做基准，快速滚动时连续多个滚轮事件会重复读到
-            // 同一个"旧"的 player.volume，算出同一个目标值，导致中间的多次
-            // 滚动步数互相覆盖、白白丢失——这正是之前"快速滚动时几乎读不到
-            // 输入"的原因（并不是阻塞导致的，是防抖窗口内的增量被覆盖了）。
-            // 用 pendingValue 做基准就能保证每一格滚动都会被正确累加上去。
+            // 在防抖窗口的 pendingValue 上累加，避免快速滚动丢步
             var base = wheelVolumeTimer.running ? wheelVolumeTimer.pendingValue : player.volume
             var newVolume = Math.max(0, Math.min(100, Math.round(base + steps * 5)))
-
             if (newVolume !== base) {
-                // 触控板等设备可能在很短时间内连续发出大量滚轮事件，
-                // 这里用一个很短的独立防抖计时器合并这些事件，只在
-                // 停止滚动的瞬间才真正下发给后端（PulseAudio/ffplay），
-                // 避免连续高频调用导致卡顿；同时又不会像拖动滑块那样
-                // 需要等待较长时间，滚动的手感依然是跟手的。
                 wheelVolumeTimer.pendingValue = newVolume
                 wheelVolumeTimer.restart()
             }

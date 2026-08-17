@@ -72,8 +72,3 @@ python /path/to/main.py
 | `~/.cache/PyMusic/instance.pid` | 单实例 PID |
 | 歌曲目录 | 下载的 `.lrc`/封面（覆盖前备份 `.bak1`/`.bak2`） |
 
-## 回退说明
-
-- 设置：设置面板底部"回退上次设置"按钮（最多连续回退两次）
-- 歌词/封面：把 `.bak1` 改回原名即可恢复
-

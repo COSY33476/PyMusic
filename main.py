@@ -158,8 +158,14 @@ def extract_embedded_image(song_path):
         key = str(song_path.resolve())
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
 
-    temp_dir = Path(tempfile.gettempdir())
-    output_path = temp_dir / f"mp2_{digest}.jpg"
+    # 输出到程序的缓存目录（方案 B：曲库扫描/首次运行在这里建立封面缓存，
+    # 重启后直接命中，无需重复 ffmpeg）
+    cover_dir = SCAN_CACHE_DIR / "covers"
+    try:
+        cover_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cover_dir = Path(tempfile.gettempdir())
+    output_path = cover_dir / f"mp2_{digest}.jpg"
 
     # Return cached if already extracted
     if output_path.is_file() and output_path.stat().st_size > 0:
@@ -422,7 +428,14 @@ def scan_music(dir_path=None):
 
 
 def _full_scan(dir_path, audio_names, image_names):
-    """全量扫描：逐文件 stat + 封面匹配（慢，仅在缓存失效时执行）"""
+    """全量扫描：逐文件 stat + 封面匹配（慢，仅在缓存失效时执行）
+
+    封面策略（方案 B）：
+    1) 优先文件封面（同名 jpg/png，find_matching_image）
+    2) 无文件封面时同步提取音频内嵌封面（ffmpeg），写入缓存目录
+       ~/.cache/PyMusic/covers/，路径随扫描缓存一起持久化——
+       首次运行会较慢（逐首 ffmpeg），之后秒开。
+    """
     # 每个目录只列一次图片文件，避免同目录下每首歌都重复 iterdir
     image_paths = [dir_path / n for n in image_names]
 
@@ -434,10 +447,14 @@ def _full_scan(dir_path, audio_names, image_names):
         except OSError:
             # 文件在扫描期间被删除/权限变化等情况，跳过而不是崩溃
             continue
+        image = find_matching_image(str(fpath), image_paths)
+        if not image:
+            # 无文件封面：尝试内嵌封面（同步提取，结果进缓存目录）
+            image = extract_embedded_image(fpath)
         songs.append({
             "path": str(fpath),
             "name": fpath.stem,
-            "image": find_matching_image(str(fpath), image_paths),
+            "image": image,
             "mtime": st.st_mtime,
         })
     return songs
@@ -465,9 +482,10 @@ class AudioPlayer(QObject):
     # saveSetting 的类型转换只针对这些已知的键：
     # 布尔键按 "true"/"false" 转换，数值键尝试转 int/float，
     # 其它键（musicDir 等路径，可能包含纯数字目录名）一律保持字符串。
-    _BOOL_SETTING_KEYS = {"darkMode", "hideControlBackgrounds", "autoSwitchToLyric", "closeToTray"}
+    _BOOL_SETTING_KEYS = {"hideControlBackgrounds", "autoSwitchToLyric", "closeToTray"}
     _NUMERIC_SETTING_KEYS = {"volume", "sortMode", "blurRadius", "panelOpacity",
-                             "rowSpacing", "lastPosition", "playMode"}
+                             "rowSpacing", "lastPosition", "playMode",
+                             "cardSize", "listStyle"}
 
     # Signals emitted to QML
     positionChanged = Signal(float)  # current position in seconds
@@ -503,6 +521,9 @@ class AudioPlayer(QObject):
         self._songs = scan_music(self._music_dir)
         self._sort_mode = 0  # 0=name asc, 1=name desc, 2=time asc, 3=time desc
         self._play_mode = 0  # 0=顺序, 1=单曲循环, 2=随机
+        # 播放列表样式：0=列表行, 1=卡片网格；卡片大小(px)
+        self._list_style = 0
+        self._card_size = 140
         # 随机模式下的播放历史（用于"上一首"回退，最多 50 条）
         self._play_history = []
         # 播放列表本地搜索词（小写，匹配歌曲名/文件名）
@@ -530,8 +551,15 @@ class AudioPlayer(QObject):
         self._fade_direction = None   # None / "out"(暂停淡出) / "in"(恢复淡入) / "quit"(退出淡出)
         self._fade_step = 0
         self._fade_total = 0
+        # 淡出代数：每次取消/结束渐变递增，用于丢弃在途的过期 pactl 音量命令
+        self._fade_generation = 0
         # 退出淡出完成后要执行的退出回调（由 main() 注入 quit_app）
         self._quit_callback = None
+
+        # 异步 pactl：在途 QProcess 集合 + 同一 pid 的 sink 查找去重
+        self._pactl_procs = {}
+        self._sink_pending = {}  # pid -> [callback, ...]
+        self._prewarm_pa()
 
         # 歌词数据
         self._lyrics = []  # list of (time_seconds, text) tuples
@@ -549,8 +577,7 @@ class AudioPlayer(QObject):
         self._seek_drag_was_playing = False
 
         # PulseAudio 探测与 sink-input 查找缓存：
-        # - _pa_available：pactl 可用性只探测一次（每次切歌/seek 都同步 spawn
-        #   pactl info 会阻塞 GUI 线程）；
+        # - _pa_available：pactl 可用性在启动时由 _prewarm_pa 异步探测一次；
         # - _sink_id_cache：同一 ffplay 进程的 sink-input index 在其生命周期内
         #   不变，按 pid 缓存可避免每次音量调节/重试都跑一遍 pactl list。
         self._pa_available = None
@@ -584,6 +611,10 @@ class AudioPlayer(QObject):
                 self._volume = max(0, min(100, int(settings["volume"])))
             if "playMode" in settings:
                 self._play_mode = max(0, min(2, int(settings["playMode"])))
+            if "listStyle" in settings:
+                self._list_style = max(0, min(1, int(settings["listStyle"])))
+            if "cardSize" in settings:
+                self._card_size = max(90, min(220, int(settings["cardSize"])))
         except Exception:
             pass
 
@@ -744,26 +775,28 @@ class AudioPlayer(QObject):
             self._volume_dirty = True
             return
 
-        # 优先尝试 PulseAudio/PipeWire 无缝调节（不中断播放，也不阻塞）
-        if self._adjust_volume_pa():
-            self._volume_dirty = False
-            return
+        # 优先尝试 PulseAudio/PipeWire 无缝调节（不中断播放，异步不阻塞）
+        def on_vol_result(ok):
+            if ok:
+                self._volume_dirty = False
+                return
+            # 回退方案：重启 ffplay 以应用新音量（仅在正在播放且没有 PA 时才需要）
+            # ffplay -nodisp 模式无法通过 stdin 按键调音量，只能重启
+            if self._state == "playing" and 0 <= self._current_index < len(self._songs):
+                # 重启前精确计算当前位置，减少进度回退
+                elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
+                pos = max(0.0, self._seek_base + elapsed)
+                # 时长未知（异步 ffprobe 还没返回）时不能按 0 clamp，否则会从头播放
+                if self._duration > 0:
+                    pos = min(pos, self._duration)
 
-        # 回退方案：重启 ffplay 以应用新音量（仅在正在播放且没有 PA 时才需要）
-        # ffplay -nodisp 模式无法通过 stdin 按键调音量，只能重启
-        if self._state == "playing" and 0 <= self._current_index < len(self._songs):
-            # 重启前精确计算当前位置，减少进度回退
-            elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
-            pos = max(0.0, self._seek_base + elapsed)
-            # 时长未知（异步 ffprobe 还没返回）时不能按 0 clamp，否则会从头播放
-            if self._duration > 0:
-                pos = min(pos, self._duration)
+                filepath = self._songs[self._current_index]["path"]
+                self._start_ffplay(filepath, pos, use_pa=False)
+                self._state = "playing"
+                self.stateChanged.emit("playing")
+                self._volume_dirty = False
 
-            filepath = self._songs[self._current_index]["path"]
-            self._start_ffplay(filepath, pos, use_pa=False)
-            self._state = "playing"
-            self.stateChanged.emit("playing")
-            self._volume_dirty = False
+        self._adjust_volume_pa(on_vol_result)
 
     # ========== 排序模式 ==========
 
@@ -793,6 +826,34 @@ class AudioPlayer(QObject):
             self._play_mode = mode
             self.saveSetting("playMode", str(mode))
             self.playModeChanged.emit()
+
+    # ========== 播放列表样式 ==========
+
+    @Property(int, notify=songListChanged)
+    def listStyle(self):
+        """播放列表样式：0=列表行, 1=卡片网格"""
+        return self._list_style
+
+    @listStyle.setter
+    def listStyle(self, style):
+        style = 0 if style != 1 else 1
+        if style != self._list_style:
+            self._list_style = style
+            self.saveSetting("listStyle", str(style))
+            self.songListChanged.emit()
+
+    @Property(int, notify=songListChanged)
+    def cardSize(self):
+        """卡片大小（px，卡片网格视图用）"""
+        return self._card_size
+
+    @cardSize.setter
+    def cardSize(self, size):
+        size = max(90, min(220, int(size)))
+        if size != self._card_size:
+            self._card_size = size
+            self.saveSetting("cardSize", str(size))
+            self.songListChanged.emit()
 
     # ========== 下载面板：搜索 & 下载 ==========
 
@@ -1049,115 +1110,143 @@ class AudioPlayer(QObject):
         self._sink_id_cache.clear()
         self._last_child_pid = None
 
-    def _check_pa_available(self):
-        """检查系统是否有可用的 PulseAudio/PipeWire
+    def _run_pactl(self, args, callback, timeout_ms=6000):
+        """非阻塞执行 pactl 命令（QProcess，不阻塞 GUI 线程）。
 
-        结果缓存：pactl 探测只在第一次需要时同步执行一次，之后直接返回
-        缓存值，避免每次切歌/seek 都 spawn 一个 pactl 进程阻塞 GUI 线程。
+        完成/超时后在主线程回调 callback(returncode, stdout_text)；
+        returncode < 0 表示超时被杀或启动失败。
+        """
+        proc = QProcess()
+        proc.setProcessChannelMode(QProcess.SeparateChannels)
+        timer = QTimer(proc)
+        timer.setSingleShot(True)
+        timer.timeout.connect(proc.kill)
+        timer.start(timeout_ms)
+
+        def _done(code):
+            if proc not in self._pactl_procs:
+                return
+            self._pactl_procs.pop(proc, None)
+            out = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
+            callback(code, out)
+
+        proc.finished.connect(_done)
+        proc.start(args[0], args[1:])
+        self._pactl_procs[proc] = True
+
+    def _prewarm_pa(self):
+        """启动时后台探测 PA 可用性，避免首次播放/退出时同步阻塞"""
+        def done(rc, out):
+            self._pa_available = rc == 0
+        self._run_pactl(["pactl", "info"], done)
+
+    def _check_pa_available(self):
+        """检查系统是否有可用的 PulseAudio/PipeWire（读缓存，不阻塞）
+
+        实际探测由 _prewarm_pa 在启动时异步完成；此处仅返回缓存值。
+        缓存仍为 None（探测未完成）时返回 True 并按 PA 路径处理，
+        音量纠正的失败分支会回退到 ffplay 自身音量。
         """
         if self._pa_available is None:
-            try:
-                result = subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=3)
-                self._pa_available = result.returncode == 0
-            except Exception:
-                self._pa_available = False
+            return True
         return self._pa_available
 
-    def _find_sink_input_id(self, pid):
-        """查找指定 pid 对应的 PulseAudio sink-input index，找不到返回 None
+    def _find_sink_input_id(self, pid, callback=None):
+        """异步查找指定 pid 的 PulseAudio sink-input index。
 
-        结果按 pid 缓存（_kill_process 时清空）：同一 ffplay 进程的
-        sink-input index 在其生命周期内不变，缓存可避免重试音量纠正时
-        反复执行开销不小的 pactl list。
-
-        注意区分两种"找不到"：sink-input 尚未注册（正常，重试即可）和
-        pactl 本身失败（PA 服务挂了）。后者要把 _pa_available 缓存置回
-        None，让下次 _check_pa_available 重新探测，避免 PA 挂掉后所有
-        新歌都按"有 PA"路径启动 100% 音量而音量纠正又永远失败。
-        """
+        结果按 pid 缓存；同一 pid 的并发查找会合并（只发一次 pactl）。
+        完成后在主线程回调 callback(index 或 None)。"""
         cached = self._sink_id_cache.get(pid)
         if cached is not None:
-            return cached
-        try:
-            result = subprocess.run(
-                ["pactl", "-f", "json", "list", "sink-inputs"],
-                capture_output=True, text=True, timeout=5
-            )
-        except Exception:
-            self._pa_available = None
-            return None
-        if result.returncode != 0:
-            self._pa_available = None
-            return None
-        try:
-            inputs = json.loads(result.stdout) if result.stdout.strip() else []
-        except ValueError:
-            self._pa_available = None
-            return None
-        for inp in inputs:
-            props = inp.get("properties", {})
-            if props.get("application.process.id") == str(pid):
-                self._sink_id_cache[pid] = inp["index"]
-                return inp["index"]
-        return None
+            if callback:
+                callback(cached)
+            return
+        if pid in self._sink_pending:
+            if callback:
+                self._sink_pending[pid].append(callback)
+            return
+        self._sink_pending[pid] = [callback] if callback else []
 
-    def _adjust_volume_pa(self):
-        """通过 PulseAudio/PipeWire pactl 无缝调节音量（不重启 ffplay）。成功返回 True。
+        def done(rc, out):
+            callbacks = self._sink_pending.pop(pid, [])
+            sink = None
+            if rc == 0 and out.strip():
+                try:
+                    inputs = json.loads(out)
+                except ValueError:
+                    inputs = None
+                if inputs is not None:
+                    for inp in inputs:
+                        props = inp.get("properties", {})
+                        if props.get("application.process.id") == str(pid):
+                            sink = inp["index"]
+                            break
+            if sink is None:
+                self._pa_available = None  # pactl 失败或 sink 未注册，下次重新探测
+            else:
+                self._sink_id_cache[pid] = sink
+            for cb in callbacks:
+                if cb:
+                    cb(sink)
 
-        单次非阻塞查找：ffplay 刚启动时 sink-input 可能还没在 PulseAudio
-        中注册完成，此时查不到对应 pid 会返回 False。调用方
-        （_start_ffplay 通过 _retry_pa_volume）负责在失败时异步重试，
-        这里不做阻塞式 sleep，避免卡住 UI 线程。
-        """
+        self._run_pactl(["pactl", "-f", "json", "list", "sink-inputs"], done)
+
+    def _adjust_volume_pa(self, callback=None):
+        """异步通过 PulseAudio/PipeWire 无缝调节音量（不中断播放，不阻塞）。
+
+        完成后在主线程回调 callback(ok)；ok=False 表示无 PA/sink 未注册，
+        调用方应回退到 ffplay 重启方案。"""
         if not self._process or self._process.state() != QProcess.Running:
-            return False
+            if callback:
+                callback(False)
+            return
         pid = self._process.processId()
         if not pid:
-            return False
+            if callback:
+                callback(False)
+            return
 
-        sink_id = self._find_sink_input_id(pid)
-        if sink_id is None:
-            return False
-
-        try:
-            # PulseAudio 音量范围 0-65536 对应 0%-100%（0dB，无增益）
+        def on_sink(sink_id):
+            if sink_id is None:
+                if callback:
+                    callback(False)
+                return
             pa_vol = int(self._volume / 100.0 * 65536)
-            result = subprocess.run(
-                ["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True
-            # 设置失败（PA 服务异常）：使可用性缓存失效，下次重新探测
-            self._pa_available = None
-            return False
-        except Exception:
-            self._pa_available = None
-            return False
+            def on_set(rc, out):
+                if rc == 0:
+                    if callback:
+                        callback(True)
+                else:
+                    self._pa_available = None
+                    if callback:
+                        callback(False)
+            self._run_pactl(["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)], on_set)
 
-    def _pa_set_volume(self, pid, pa_vol):
-        """对指定进程的 PA sink-input 设置音量（0-65536）。失败返回 False"""
-        sink_id = self._find_sink_input_id(pid)
-        if sink_id is None:
-            return False
-        try:
-            result = subprocess.run(
-                ["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True
-            self._pa_available = None
-            return False
-        except Exception:
-            self._pa_available = None
-            return False
+        self._find_sink_input_id(pid, on_sink)
+
+    def _pa_set_volume(self, pid, pa_vol, gen=None):
+        """异步设置指定进程的 PA 音量（不阻塞，fire-and-forget）。
+
+        gen 为淡出代数：与当前 _fade_generation 不一致时丢弃（过期命令）。
+        """
+        def on_sink(sink_id):
+            if sink_id is None:
+                self._pa_available = None
+                return
+            if gen is not None and gen != self._fade_generation:
+                return  # 淡出已被取消/替换，丢弃在途命令
+            self._run_pactl(["pactl", "set-sink-input-volume", str(sink_id), str(pa_vol)],
+                            lambda rc, out: None)
+
+        self._find_sink_input_id(pid, on_sink)
 
     def _cancel_fade(self):
         """取消进行中的音量渐变（切歌/停止/seek 时调用）"""
         if self._fade_direction is not None:
             self._fade_timer.stop()
             self._fade_direction = None
+        # 递增代数，使所有在途的过期 pactl 音量命令失效
+        self._fade_generation += 1
 
     def setQuitCallback(self, callback):
         """注入退出回调（quit_app）：退出淡出完成后调用"""
@@ -1168,6 +1257,7 @@ class AudioPlayer(QObject):
         """退出淡出：PA 音量 300ms 平滑降到 0 后终止进程并触发退出回调。
 
         PA 不可用/无运行进程时直接退出（无淡出可做）。
+        sink 查找为异步，不阻塞 GUI 线程（PA 响应慢也不会卡住退出）。
         """
         if not self._quit_callback:
             self.cleanup()
@@ -1175,33 +1265,55 @@ class AudioPlayer(QObject):
         # 若正在暂停淡出/淡入，先取消再走退出淡出
         if self._fade_direction is not None:
             self._cancel_fade()
-        if self._start_fade("quit", duration_ms=300):
-            return  # 完成后在 _on_fade_tick 的 "quit" 分支继续
-        self.cleanup()
-        self._quit_callback()
 
-    def _start_fade(self, direction, duration_ms=250):
+        def on_done(ok):
+            if ok:
+                return  # 完成后在 _on_fade_tick 的 "quit" 分支继续
+            self.cleanup()
+            if self._quit_callback:
+                self._quit_callback()
+
+        self._start_fade("quit", duration_ms=300, on_done=on_done)
+
+    def _start_fade(self, direction, duration_ms=250, on_done=None):
         """开始 PA 音量渐变：out=淡出到 0（暂停），in=淡入（恢复），
         quit=淡出到 0 后终止进程并退出。
 
         duration_ms: 渐变时长（默认 250，退出淡出用 300）。
-        返回 False 表示 PA 不可用/sink 未注册（调用方应走硬切逻辑）。
+        sink 查找为异步；完成后回调 on_done(True/False)：False 表示
+        PA 不可用/sink 未注册/进程已切换（调用方应走硬切逻辑）。
         """
         if not self._process or self._process.state() != QProcess.Running:
-            return False
+            if on_done:
+                on_done(False)
+            return
         pid = self._process.processId()
         if not pid:
-            return False
-        if self._find_sink_input_id(pid) is None:
-            return False
-        self._fade_direction = direction
-        self._fade_step = 0
-        self._fade_total = max(1, round(duration_ms / self._fade_timer.interval()))
-        self._fade_timer.start()
-        return True
+            if on_done:
+                on_done(False)
+            return
+
+        def on_sink(sink_id):
+            if sink_id is None:
+                if on_done:
+                    on_done(False)
+                return
+            # 查找期间进程可能已被切换/停止，此时不应启动渐变
+            if self._process is None or self._process.processId() != pid:
+                if on_done:
+                    on_done(False)
+                return
+            self._fade_direction = direction
+            self._fade_step = 0
+            self._fade_total = max(1, round(duration_ms / self._fade_timer.interval()))
+            self._fade_timer.start()
+            if on_done:
+                on_done(True)
+
+        self._find_sink_input_id(pid, on_sink)
 
     def _on_fade_tick(self):
-        """渐变定时器：每 30ms 调一次 PA 音量，到终点执行挂起/恢复"""
+        """渐变定时器：每 30ms 异步调一次 PA 音量，到终点执行挂起/恢复"""
         if self._fade_direction is None:
             self._fade_timer.stop()
             return
@@ -1216,11 +1328,13 @@ class AudioPlayer(QObject):
         else:
             # "out"(暂停淡出) 与 "quit"(退出淡出) 都是淡出到 0
             pa_vol = int(self._volume / 100.0 * 65536 * (1.0 - t))
-        ok = self._pa_set_volume(pid, pa_vol)
-        if t >= 1.0 or not ok:
+        gen = self._fade_generation
+        self._pa_set_volume(pid, pa_vol, gen)
+        if t >= 1.0:
             self._fade_timer.stop()
             direction = self._fade_direction
             self._fade_direction = None
+            self._fade_generation += 1  # 丢弃任何在途的过期命令
             if direction == "quit":
                 # 退出淡出完成：音量已近 0，终止进程并触发退出回调
                 self._kill_process()
@@ -1254,15 +1368,20 @@ class AudioPlayer(QObject):
         if process_ref.state() == QProcess.NotRunning:
             return
 
-        if self._adjust_volume_pa():
-            return  # 成功，音量已纠正
+        def on_result(ok):
+            if ok:
+                return  # 成功，音量已纠正
+            if process_ref is not self._process:
+                return
+            if process_ref.state() == QProcess.NotRunning:
+                return
+            max_attempts = 8
+            if attempt >= max_attempts:
+                return
+            delay_ms = min(50 * (attempt + 1), 400)
+            QTimer.singleShot(delay_ms, lambda: self._retry_pa_volume(process_ref, attempt + 1))
 
-        max_attempts = 8
-        if attempt >= max_attempts:
-            return
-
-        delay_ms = min(50 * (attempt + 1), 400)
-        QTimer.singleShot(delay_ms, lambda: self._retry_pa_volume(process_ref, attempt + 1))
+        self._adjust_volume_pa(on_result)
 
     def _start_ffplay(self, filepath, seek_to=0.0, use_pa=None):
         """启动 ffplay 进程播放指定音频文件，支持从指定位置开始播放
@@ -1470,11 +1589,22 @@ class AudioPlayer(QObject):
         if self._process and self._process.state() == QProcess.Running:
             pid = self._process.processId()
             if pid > 0:
-                # PA 可用时平滑淡出；淡出完成回调里才 SIGSTOP + 转 paused
-                if self._start_fade("out"):
-                    return
-                os.kill(pid, signal.SIGSTOP)
-                self._pause_time = self._get_current_time()
+                # PA 可用时平滑淡出；淡出完成回调里才 SIGSTOP + 转 paused。
+                # sink 查找异步（不阻塞 GUI）；失败则立即硬暂停。
+                def on_fade_out(ok):
+                    if ok:
+                        return  # 淡出完成回调里转 paused
+                    try:
+                        os.kill(pid, signal.SIGSTOP)
+                    except OSError:
+                        pass
+                    self._pause_time = self._get_current_time()
+                    self._state = "paused"
+                    self.stateChanged.emit("paused")
+                    self._position_timer.stop()
+
+                self._start_fade("out", on_done=on_fade_out)
+                return
         elif self._process and self._process.state() == QProcess.Starting:
             self._process.started.connect(self._pause_new_process)
         self._state = "paused"
@@ -1508,18 +1638,25 @@ class AudioPlayer(QObject):
         # 应用暂停期间累积但未生效的音量变更。
         # 淡入进行中时跳过：渐变结束时音量已经是 _volume，无需再调整
         if self._volume_dirty:
-            if self._fade_direction is None and not self._adjust_volume_pa():
-                elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
-                pos = max(0.0, self._seek_base + elapsed)
-                # 时长未知（异步 ffprobe 还没返回）时不能按 0 clamp，否则会从头播放
-                if self._duration > 0:
-                    pos = min(pos, self._duration)
-                filepath = self._songs[self._current_index]["path"] if 0 <= self._current_index < len(self._songs) else None
-                if filepath:
-                    self._start_ffplay(filepath, pos, use_pa=False)
-                    self._state = "playing"
-                    self.stateChanged.emit("playing")
-            self._volume_dirty = False
+            if self._fade_direction is None:
+                def on_dirty_result(ok):
+                    self._volume_dirty = False
+                    if ok:
+                        return
+                    elapsed = self._get_current_time() - self._play_start_time - self._total_paused_duration
+                    pos = max(0.0, self._seek_base + elapsed)
+                    # 时长未知（异步 ffprobe 还没返回）时不能按 0 clamp，否则会从头播放
+                    if self._duration > 0:
+                        pos = min(pos, self._duration)
+                    filepath = self._songs[self._current_index]["path"] if 0 <= self._current_index < len(self._songs) else None
+                    if filepath:
+                        self._start_ffplay(filepath, pos, use_pa=False)
+                        self._state = "playing"
+                        self.stateChanged.emit("playing")
+
+                self._adjust_volume_pa(on_dirty_result)
+            else:
+                self._volume_dirty = False
 
     @Slot()
     def playPause(self):
@@ -1889,6 +2026,11 @@ class AudioPlayer(QObject):
             self.saveSetting("lastPosition", str(self._position))
         self._kill_process()
         self._position_timer.stop()
+        # 终止所有在途的异步 pactl 进程
+        for proc in list(self._pactl_procs):
+            proc.kill()
+        self._pactl_procs.clear()
+        self._sink_pending.clear()
 
     @Slot(result=bool)
     def restoreLastPosition(self):
@@ -1942,10 +2084,8 @@ class AudioPlayer(QObject):
     def loadSettings(self):
         """从配置文件加载所有设置"""
         defaults = {
-            "darkMode": True,
             "customAccent": "",
             "customDarkBg": "",
-            "customLightBg": "",
             "customLyricColor": "",
             "customLyricPlayedColor": "",
             "customLyricUnplayedColor": "",
@@ -1958,6 +2098,8 @@ class AudioPlayer(QObject):
             "lastPosition": 0.0,
             "sortMode": 0,
             "playMode": 0,
+            "listStyle": 0,
+            "cardSize": 140,
             "musicDir": str(MUSIC_DIR),
             "rowSpacing": 48,
             "customFontFamily": "",
