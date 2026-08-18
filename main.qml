@@ -21,6 +21,26 @@ ApplicationWindow {
     flags: _frameless ? Qt.FramelessWindowHint : Qt.Window
     color: "transparent"
 
+    // 启动防白屏：首帧渲染完成前窗口保持全透明（opacity 0），首帧交换后
+    // 250ms 淡入——用户看到的是"窗口淡入"而不是"白屏→内容"。
+    property bool _booted: false
+    opacity: 0
+    onFrameSwapped: {
+        if (!window._booted) {
+            window._booted = true
+            bootFadeIn.start()
+        }
+    }
+    NumberAnimation {
+        id: bootFadeIn
+        target: window
+        property: "opacity"
+        from: 0
+        to: 1
+        duration: 250
+        easing.type: Easing.OutCubic
+    }
+
     // 点击 × 时：根据 closeToTray 决定隐藏到托盘还是退出。
     // 系统没有可用托盘时（部分精简桌面环境），隐藏窗口会导致程序
     // 无任何入口可恢复，必须直接退出。
@@ -77,6 +97,12 @@ ApplicationWindow {
     property string customLyricPlayedColor: ""
     property string customLyricUnplayedColor: ""
     property string customBtnBg: ""
+
+    // 桌面歌词样式（空字符串表示使用默认值）
+    property string desktopLyricFont: ""     // 桌面歌词字体族
+    property string desktopLyricColor: ""    // 桌面歌词当前行颜色
+    // 桌面歌词"锁定歌词"：开启后窗口点击穿透、不可挪动
+    property bool desktopLyricLocked: false
 
     // 解析后的颜色属性（string → color，用于 lyrics 等 var 上下文，避免 .r/.g/.b 失效）
     property color _resolvedLyricColor: customLyricColor !== "" ? customLyricColor : accent
@@ -190,6 +216,9 @@ ApplicationWindow {
         saveSetting("customFontFamily", customFontFamily)
         saveSetting("autoSwitchToLyric", autoSwitchToLyric)
         saveSetting("closeToTray", closeToTray)
+        saveSetting("desktopLyricFont", desktopLyricFont)
+        saveSetting("desktopLyricColor", desktopLyricColor)
+        saveSetting("desktopLyricLocked", desktopLyricLocked)
         saveSetting("volume", player.volume)
     }
 
@@ -216,6 +245,12 @@ ApplicationWindow {
         player.applyGlobalFont(customFontFamily)
         if (s.autoSwitchToLyric !== undefined) autoSwitchToLyric = s.autoSwitchToLyric
         if (s.closeToTray !== undefined) closeToTray = s.closeToTray
+        if (s.desktopLyricFont !== undefined) desktopLyricFont = s.desktopLyricFont
+        if (s.desktopLyricColor !== undefined) desktopLyricColor = s.desktopLyricColor
+        if (s.desktopLyricLocked !== undefined) desktopLyricLocked = s.desktopLyricLocked
+        // 把桌面歌词样式应用到后端（QML 的属性的 onChange 也会触发，这里兜底）
+        if (typeof appBridge !== "undefined")
+            appBridge.setDesktopStyle(desktopLyricFont, desktopLyricColor)
         if (s.volume !== undefined) player.volume = s.volume
         if (s.musicDir !== undefined) player.setMusicDir(s.musicDir)
         if (s.lastFile !== undefined && s.lastFile) player.restoreLastPosition()
@@ -258,6 +293,19 @@ ApplicationWindow {
     }
     onAutoSwitchToLyricChanged: saveSetting("autoSwitchToLyric", autoSwitchToLyric)
     onCloseToTrayChanged: saveSetting("closeToTray", closeToTray)
+    onDesktopLyricFontChanged: {
+        saveSetting("desktopLyricFont", desktopLyricFont)
+        appBridge.setDesktopStyle(desktopLyricFont, desktopLyricColor)
+    }
+    onDesktopLyricColorChanged: {
+        saveSetting("desktopLyricColor", desktopLyricColor)
+        appBridge.setDesktopStyle(desktopLyricFont, desktopLyricColor)
+    }
+    onDesktopLyricLockedChanged: {
+        saveSetting("desktopLyricLocked", desktopLyricLocked)
+        if (typeof appBridge !== "undefined")
+            appBridge.setDesktopLyricsLocked(desktopLyricLocked)
+    }
 
     Connections {
         target: player
@@ -3866,7 +3914,7 @@ ApplicationWindow {
                     Button {
                         text: "选择"
                         font.pixelSize: 11
-                        onClicked: fontDialog.open()
+                        onClicked: fontDialog.openFor("global", customFontFamily)
                         background: Rectangle {
                             implicitWidth: 52
                             implicitHeight: 28
@@ -4008,6 +4056,216 @@ ApplicationWindow {
                         font: parent.font
                         horizontalAlignment: Text.AlignHCenter
                         verticalAlignment: Text.AlignVCenter
+                    }
+                }
+
+                // ===== 分割线 =====
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.topMargin: 10
+                    Layout.bottomMargin: 4
+                    height: 1
+                    color: textMuted
+                    opacity: 0.3
+                }
+
+                // ===== 桌面歌词设置 =====
+                Text {
+                    font.family: window.uiFontFamily
+                    text: "桌面歌词"
+                    color: textPrimary
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+
+                // 桌面歌词开关
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "启用桌面歌词"
+                        color: textPrimary
+                        font.pixelSize: 12
+                    }
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: appBridge.desktopAvailable ? "" : "（不可用）"
+                        color: textMuted
+                        font.pixelSize: 10
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    Rectangle {
+                        width: 40; height: 22; radius: 11
+                        color: appBridge.desktopLyricsEnabled ? accent : "#3a3a5e"
+                        opacity: appBridge.desktopAvailable ? 1.0 : 0.4
+                        Behavior on color { ColorAnimation { duration: 150 } }
+
+                        Rectangle {
+                            x: appBridge.desktopLyricsEnabled ? 20 : 2
+                            y: 2
+                            width: 18; height: 18; radius: 9
+                            color: "#ffffff"
+                            Behavior on x { NumberAnimation { duration: 150 } }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: appBridge.desktopAvailable
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: appBridge.setDesktopLyrics(!appBridge.desktopLyricsEnabled)
+                        }
+                    }
+                }
+
+                // 桌面歌词锁定（开关：决定是否可以直接被挪动）
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "锁定歌词"
+                        color: textPrimary
+                        font.pixelSize: 12
+                    }
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "开启后不可拖动"
+                        color: textMuted
+                        font.pixelSize: 10
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    Rectangle {
+                        width: 40; height: 22; radius: 11
+                        color: desktopLyricLocked ? accent : "#3a3a5e"
+                        opacity: appBridge.desktopAvailable ? 1.0 : 0.4
+                        Behavior on color { ColorAnimation { duration: 150 } }
+
+                        Rectangle {
+                            x: desktopLyricLocked ? 20 : 2
+                            y: 2
+                            width: 18; height: 18; radius: 9
+                            color: "#ffffff"
+                            Behavior on x { NumberAnimation { duration: 150 } }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: appBridge.desktopAvailable
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: desktopLyricLocked = !desktopLyricLocked
+                        }
+                    }
+                }
+
+                // 桌面歌词字体
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "歌词字体"
+                        color: textPrimary
+                        font.pixelSize: 12
+                        Layout.preferredWidth: 60
+                    }
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: desktopLyricFont !== "" ? desktopLyricFont : "（默认）"
+                        color: desktopLyricFont !== "" ? textPrimary : textMuted
+                        font.pixelSize: 12
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+
+                    Button {
+                        text: "选择"
+                        font.pixelSize: 11
+                        onClicked: fontDialog.openFor("desktop", desktopLyricFont)
+                        background: Rectangle {
+                            implicitWidth: 52
+                            implicitHeight: 28
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
+                            radius: 6
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: textPrimary
+                            font: parent.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+
+                    Button {
+                        text: "重置"
+                        font.pixelSize: 11
+                        onClicked: desktopLyricFont = ""
+                        background: Rectangle {
+                            implicitWidth: 52
+                            implicitHeight: 28
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
+                            radius: 6
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: textPrimary
+                            font: parent.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                    }
+                }
+
+                // 桌面歌词颜色
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Text {
+                        font.family: window.uiFontFamily
+                        text: "歌词颜色"
+                        color: textPrimary
+                        font.pixelSize: 12
+                        Layout.preferredWidth: 60
+                    }
+
+                    Rectangle {
+                        width: 22; height: 22; radius: 4
+                        color: desktopLyricColor !== "" ? desktopLyricColor : "#ffffff"
+                        border.color: textMuted
+                        border.width: 1
+                    }
+
+                    Item { Layout.fillWidth: true }
+
+                    Button {
+                        text: "选择"
+                        font.pixelSize: 11
+                        onClicked: openColorDialog("desktopLyricColor", desktopLyricColor !== "" ? desktopLyricColor : "#ffffff")
+                        background: Rectangle {
+                            implicitWidth: 52
+                            implicitHeight: 28
+                            color: customBtnBg !== "" ? customBtnBg : "#2a2a4e"
+                            radius: 4
+                        }
+                        contentItem: Text {
+                            text: parent.text
+                            color: textPrimary
+                            font: parent.font
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                        }
                     }
                 }
 
@@ -4325,6 +4583,7 @@ ApplicationWindow {
                 case "customLyricPlayedColor": customLyricPlayedColor = selectedColor; break
                 case "customLyricUnplayedColor": customLyricUnplayedColor = selectedColor; break
                 case "customBtnBg": customBtnBg = selectedColor; break
+                case "desktopLyricColor": desktopLyricColor = selectedColor; break
                 
             }
         }
@@ -4333,7 +4592,7 @@ ApplicationWindow {
     // ===== 字体选择对话框（自定义列表，不依赖原生 Dialog） =====
     Dialog {
         id: fontDialog
-        title: "选择全局字体"
+        title: "选择字体"
         modal: true
         width: 380
         height: 480
@@ -4341,11 +4600,24 @@ ApplicationWindow {
 
         property var allFonts: Qt.fontFamilies()
         property string _selectedFont: ""
+        // 目标：用于区分对话框服务的是"全局字体"还是"桌面歌词字体"。
+        // 打开前用 openFor(targetContent, targetValue) 设置。
+        property string target: "global"   // "global" | "desktop"
+
+        function openFor(t, value) {
+            fontDialog.target = t
+            fontDialog._selectedFont = value || ""
+            fontDialog.open()
+        }
 
         onAccepted: {
             if (_selectedFont) {
-                customFontFamily = _selectedFont
-                customFontInput.text = _selectedFont
+                if (fontDialog.target === "desktop") {
+                    desktopLyricFont = _selectedFont
+                } else {
+                    customFontFamily = _selectedFont
+                    customFontInput.text = _selectedFont
+                }
             }
         }
 
@@ -4360,7 +4632,7 @@ ApplicationWindow {
             Text {
                 font.family: window.uiFontFamily
                 anchors.centerIn: parent
-                text: "选择全局字体"
+                text: fontDialog.target === "desktop" ? "选择桌面歌词字体" : "选择全局字体"
                 color: textPrimary
                 font.pixelSize: 15
                 font.bold: true

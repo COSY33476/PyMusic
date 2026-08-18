@@ -54,6 +54,16 @@ os.environ.setdefault("QSG_INFO", "1")
 # PYMUSIC_VERBOSE=1 时输出更详细的运行期日志（歌词索引变化等）
 _VERBOSE = os.environ.get("PYMUSIC_VERBOSE") == "1"
 
+# 歌词索引提前量（秒）：播放器/桌面歌词的滚动与高亮是动画驱动的，动画
+# （highlightMoveDuration 等）会让"当前行跳到新一句"这个视觉动作比音频
+# 实际唱到那句滞后约 0.1~0.3s。用一个小的提前量让索引在歌词时间戳到达前
+# 就切过去，抵消动画延迟，观看上与演唱同步。可用
+# PYMUSIC_LYRIC_LEAD_MS 覆盖（单位毫秒）。
+try:
+    _LYRIC_LEAD_SEC = int(os.environ.get("PYMUSIC_LYRIC_LEAD_MS", "300")) / 1000.0
+except ValueError:
+    _LYRIC_LEAD_SEC = 0.3
+
 import logging
 import logging.handlers
 import faulthandler
@@ -636,7 +646,8 @@ class AudioPlayer(QObject):
     # saveSetting 的类型转换只针对这些已知的键：
     # 布尔键按 "true"/"false" 转换，数值键尝试转 int/float，
     # 其它键（musicDir 等路径，可能包含纯数字目录名）一律保持字符串。
-    _BOOL_SETTING_KEYS = {"hideControlBackgrounds", "autoSwitchToLyric", "closeToTray"}
+    _BOOL_SETTING_KEYS = {"hideControlBackgrounds", "autoSwitchToLyric", "closeToTray",
+                          "desktopLyricsEnabled", "desktopLyricLocked"}
     _NUMERIC_SETTING_KEYS = {"volume", "sortMode", "blurRadius", "panelOpacity",
                              "rowSpacing", "lastPosition", "playMode",
                              "cardSize", "listStyle"}
@@ -647,7 +658,7 @@ class AudioPlayer(QObject):
     stateChanged = Signal(str)       # "playing", "paused", "stopped"
     songChanged = Signal(int)        # current song index
     songListChanged = Signal()
-    lyricIndexChanged = Signal(int)  # current lyric line index
+    lyricIndexChanged = Signal(int)  # current lyric line index（带提前量，供播放器主界面）
     lyricsChanged = Signal()         # lyrics list changed
     musicDirChanged = Signal()       # music directory changed
     sortModeChanged = Signal()       # sort mode changed
@@ -2337,7 +2348,7 @@ class AudioPlayer(QObject):
             self._lyrics = lyrics or []
             # 立即按当前播放位置计算索引：让 QML 的 rebuildGroups+snapAll
             # 一次就位到当前行，避免"先回顶部再跳回"造成的弹跳
-            self._current_lyric_index = self._find_lyric_index(self._position)
+            self._current_lyric_index = self._find_lyric_index(self._lyric_lookup_position())
             _log("歌词", "加载完成: %d 行，当前行索引 %d"
                  % (len(self._lyrics), self._current_lyric_index))
             self.lyricsChanged.emit()
@@ -2411,6 +2422,14 @@ class AudioPlayer(QObject):
                 return True
         return False
 
+    def _lyric_lookup_position(self):
+        """歌词索引查找用的位置：当前播放位置 + 提前量。
+
+        提前量用于抵消播放器里滚动/高亮动画的视觉延迟（见 _LYRIC_LEAD_SEC）。
+        桌面歌词与主界面都消费 lyricIndexChanged，因此两端同步提前。
+        """
+        return self._position + _LYRIC_LEAD_SEC
+
     def _find_lyric_index(self, pos):
         """二分查找最后一个 时间<=pos 的歌词行，无匹配返回 -1"""
         if not self._lyrics:
@@ -2427,13 +2446,16 @@ class AudioPlayer(QObject):
         return idx
 
     def _update_lyric_index(self):
-        """根据当前播放位置更新歌词索引（二分查找）"""
+        """根据当前播放位置（+提前量）更新歌词索引（二分查找）。
+
+        提前量索引（lyricIndexChanged）供播放器主界面与桌面歌词共同使用，
+        用于抵消滚动/高亮动画延迟。"""
         if not self._lyrics:
             if self._current_lyric_index != -1:
                 self._current_lyric_index = -1
                 self.lyricIndexChanged.emit(-1)
             return
-        idx = self._find_lyric_index(self._position)
+        idx = self._find_lyric_index(self._lyric_lookup_position())
         if idx != self._current_lyric_index:
             if _VERBOSE:
                 _log("歌词", "索引 %d → %d @ pos=%.2fs (当前句时间 %.2fs)"
@@ -2642,12 +2664,16 @@ def _setup_signal_handlers(player):
 
 
 class AppBridge(QObject):
-    """桥接对象，向 QML 暴露 Python 侧的退出等功能"""
+    """桥接对象，向 QML 暴露 Python 侧的退出/桌面歌词等功能"""
+
+    desktopLyricsEnabledChanged = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._quit_callback = None
         self._tray_available = True
+        self._player = None
+        self._desktop_available = False
 
     def setQuitCallback(self, callback):
         self._quit_callback = callback
@@ -2657,9 +2683,57 @@ class AppBridge(QObject):
         否则窗口藏起来后没有任何入口能恢复（托盘图标不存在）。"""
         self._tray_available = bool(available)
 
+    def setPlayer(self, player):
+        """记录 AudioPlayer，供桌面歌词开关使用。"""
+        self._player = player
+
+    def setDesktopAvailable(self, available):
+        """记录桌面歌词模块是否可用（初始化失败时设置面板开关禁用）。"""
+        self._desktop_available = bool(available)
+
     @Property(bool, constant=True)
     def trayAvailable(self):
         return self._tray_available
+
+    @Property(bool, constant=True)
+    def desktopAvailable(self):
+        return self._desktop_available
+
+    @Property(bool, notify=desktopLyricsEnabledChanged)
+    def desktopLyricsEnabled(self):
+        try:
+            import desktop as _d
+            return _d.is_desktop_lyrics_enabled()
+        except Exception:
+            return False
+
+    @Slot(bool)
+    def setDesktopLyrics(self, on):
+        """开关桌面歌词（QML 开关控件调用）。"""
+        try:
+            import desktop as _d
+            _d.set_desktop_lyrics_enabled(on, self._player)
+            self.desktopLyricsEnabledChanged.emit(on)
+        except Exception as e:
+            _log_warn("桌面歌词", "切换失败: %s" % e)
+
+    @Slot(str, str)
+    def setDesktopStyle(self, font, color):
+        """设置桌面歌词字体/颜色（QML 设置面板调用，空串表示用默认值）。"""
+        try:
+            import desktop as _d
+            _d.set_desktop_style(font or "", color or "", self._player)
+        except Exception as e:
+            _log_warn("桌面歌词", "设置样式失败: %s" % e)
+
+    @Slot(bool)
+    def setDesktopLyricsLocked(self, locked):
+        """设置"锁定歌词"（QML 设置面板开关调用）：锁定后桌面歌词不可挪动。"""
+        try:
+            import desktop as _d
+            _d.set_desktop_lyrics_locked(locked, self._player)
+        except Exception as e:
+            _log_warn("桌面歌词", "设置锁定状态失败: %s" % e)
 
     @Slot()
     def quitApp(self):
@@ -2766,18 +2840,19 @@ def main():
     engine = QQmlApplicationEngine()
     player = AudioPlayer()
 
+    # 桌面歌词：模块级管理器懒创建透明置顶小窗（由设置面板开关控制）。
+    # 这里仅确保控制器存在并绑定 player，不自动显示——是否显示由
+    # AppBridge.setDesktopLyrics / 已保存的设置决定。
+    # Wayland+KDE 下置顶需配合 KWin 窗口规则（见 desktop.py docstring）。
+    try:
+        import desktop as _desktop_mod
+        _desktop_mod.ensure_desktop_lyrics(player)
+    except Exception as e:
+        _desktop_mod = None
+        _log_warn("桌面歌词", "初始化失败（设置面板开关将不可用）: %s" % e)
+
     # 注册信号处理器，确保异常退出时清理子进程
     _setup_signal_handlers(player)
-
-    engine.rootContext().setContextProperty("player", player)
-    app.aboutToQuit.connect(player.cleanup)
-    engine.load(str(Path(__file__).parent / "main.qml"))
-
-    if not engine.rootObjects():
-        print("错误: 无法加载 QML 文件")
-        return -1
-
-    window = engine.rootObjects()[0]
 
     def show_window():
         """恢复并激活主窗口（双击托盘图标 / 菜单中"显示主窗口"触发）"""
@@ -2787,15 +2862,48 @@ def main():
 
     def quit_app():
         """真正退出程序：先清理子进程，再关闭托盘图标，最后退出事件循环"""
+        if _desktop_mod is not None:
+            try:
+                _desktop_mod.close_desktop_lyrics()
+            except Exception:
+                pass
         player.cleanup()
         tray.hide()
         app.quit()
 
-    # 桥接对象：向 QML 暴露 quitApp()
+    # 桥接对象：向 QML 暴露 quitApp()/桌面歌词开关。
+    # 注意：必须在 engine.load() 之前设置 appBridge 上下文属性，否则 QML 里
+    # 布局阶段就引用 appBridge 的绑定（如桌面歌词开关）会报 ReferenceError。
     bridge = AppBridge()
     bridge.setQuitCallback(quit_app)
     bridge.setTrayAvailable(QSystemTrayIcon.isSystemTrayAvailable())
+    bridge.setPlayer(player)
+    bridge.setDesktopAvailable(_desktop_mod is not None)
+
+    engine.rootContext().setContextProperty("player", player)
     engine.rootContext().setContextProperty("appBridge", bridge)
+    app.aboutToQuit.connect(player.cleanup)
+    engine.load(str(Path(__file__).parent / "main.qml"))
+
+    if not engine.rootObjects():
+        print("错误: 无法加载 QML 文件")
+        return -1
+
+    window = engine.rootObjects()[0]
+
+    # 应用上次保存的桌面歌词状态（上次开启则本次自动显示）
+    if _desktop_mod is not None and bridge.desktopLyricsEnabled:
+        try:
+            _desktop_mod.set_desktop_lyrics_enabled(True, player)
+            # 这里直接调用的是 desktop 模块的函数，没有经过
+            # bridge.setDesktopLyrics()，所以不会自动触发
+            # desktopLyricsEnabledChanged —— 设置面板里的开关控件在
+            # engine.load() 时已经按"未恢复前"的状态渲染过一次，如果不
+            # 在这里手动补发一次信号，即便窗口这次确实正常恢复显示了，
+            # 面板上的开关看起来仍然是"关"的，容易让人误以为又失败了。
+            bridge.desktopLyricsEnabledChanged.emit(True)
+        except Exception as e:
+            _log_warn("桌面歌词", "恢复上次状态失败: %s" % e)
     # 退出淡出：X 按钮走 player.fadeOutQuit()，淡出完成后调用同一退出回调
     player.setQuitCallback(quit_app)
 
