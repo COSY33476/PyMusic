@@ -21,10 +21,14 @@ ApplicationWindow {
     flags: _frameless ? Qt.FramelessWindowHint : Qt.Window
     color: "transparent"
 
-    // 启动防白屏：首帧渲染完成前窗口保持全透明（opacity 0），首帧交换后
+    // 启动防白屏：首帧渲染完成前内容保持全透明（opacity 0），首帧交换后
     // 250ms 淡入——用户看到的是"窗口淡入"而不是"白屏→内容"。
+    // 注意：淡入必须作用在窗口内的根容器 rootSurface 上，不能作用在
+    // ApplicationWindow 上——Wayland 平台不支持窗口级透明度，对
+    // window.opacity 的每次赋值都会刷一条
+    // "This plugin does not support setting window opacity" 警告
+    // （250ms 动画约 37 帧 = 37 条）。
     property bool _booted: false
-    opacity: 0
     onFrameSwapped: {
         if (!window._booted) {
             window._booted = true
@@ -33,7 +37,7 @@ ApplicationWindow {
     }
     NumberAnimation {
         id: bootFadeIn
-        target: window
+        target: rootSurface
         property: "opacity"
         from: 0
         to: 1
@@ -480,6 +484,8 @@ ApplicationWindow {
         radius: (_frameless && window.visibility !== Window.Maximized) ? 12 : 0
         clip: true
         color: bgDark
+        // 启动防白屏：初始全透明，首帧交换后由 bootFadeIn 淡入（见上）
+        opacity: 0
 
         // ===== 背景层容器（唯一进入蒙版层的部分） =====
         // 整窗 layer+OpacityMask 会把所有文字也渲染进离屏纹理再采样，
@@ -4092,7 +4098,7 @@ ApplicationWindow {
 
                     Text {
                         font.family: window.uiFontFamily
-                        text: appBridge.desktopAvailable ? "" : "（不可用）"
+                        text: appBridge && appBridge.desktopAvailable ? "" : "（不可用）"
                         color: textMuted
                         font.pixelSize: 10
                     }
@@ -4101,12 +4107,12 @@ ApplicationWindow {
 
                     Rectangle {
                         width: 40; height: 22; radius: 11
-                        color: appBridge.desktopLyricsEnabled ? accent : "#3a3a5e"
-                        opacity: appBridge.desktopAvailable ? 1.0 : 0.4
+                        color: (appBridge && appBridge.desktopLyricsEnabled) ? accent : "#3a3a5e"
+                        opacity: appBridge && appBridge.desktopAvailable ? 1.0 : 0.4
                         Behavior on color { ColorAnimation { duration: 150 } }
 
                         Rectangle {
-                            x: appBridge.desktopLyricsEnabled ? 20 : 2
+                            x: (appBridge && appBridge.desktopLyricsEnabled) ? 20 : 2
                             y: 2
                             width: 18; height: 18; radius: 9
                             color: "#ffffff"
@@ -4115,9 +4121,9 @@ ApplicationWindow {
 
                         MouseArea {
                             anchors.fill: parent
-                            enabled: appBridge.desktopAvailable
+                            enabled: appBridge && appBridge.desktopAvailable
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: appBridge.setDesktopLyrics(!appBridge.desktopLyricsEnabled)
+                            onClicked: appBridge && appBridge.setDesktopLyrics(!appBridge.desktopLyricsEnabled)
                         }
                     }
                 }
@@ -4146,7 +4152,7 @@ ApplicationWindow {
                     Rectangle {
                         width: 40; height: 22; radius: 11
                         color: desktopLyricLocked ? accent : "#3a3a5e"
-                        opacity: appBridge.desktopAvailable ? 1.0 : 0.4
+                        opacity: appBridge && appBridge.desktopAvailable ? 1.0 : 0.4
                         Behavior on color { ColorAnimation { duration: 150 } }
 
                         Rectangle {
@@ -4159,7 +4165,7 @@ ApplicationWindow {
 
                         MouseArea {
                             anchors.fill: parent
-                            enabled: appBridge.desktopAvailable
+                            enabled: appBridge && appBridge.desktopAvailable
                             cursorShape: Qt.PointingHandCursor
                             onClicked: desktopLyricLocked = !desktopLyricLocked
                         }

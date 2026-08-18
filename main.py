@@ -134,17 +134,8 @@ def _install_qt_msg_handler():
     qInstallMessageHandler(_qt_handler)
 
 
-# ffplay stderr 噪音过滤：启动横幅 / 输入流信息 / 元数据（用户要求
-# 这些不要进日志和 journal），真正的错误（No such file 等）保留。
-_FFPLAY_NOISE_RE = re.compile(
-    r"^(ffplay version|built with|configuration:|libav[a-z0-9]+|"
-    r"Input #|Metadata:|Duration:|Stream #|"
-    r"\s{2,})"
-)
-
-
-def _is_ffplay_noise(line):
-    return bool(_FFPLAY_NOISE_RE.match(line))
+# ffplay stderr 已直接转发到终端（ForwardedErrorChannel），不再需要
+# 捕获与噪音过滤，相关代码已移除。
 
 
 def _log_startup_diagnostics():
@@ -1560,7 +1551,6 @@ class AudioPlayer(QObject):
             self._fade_step = 0
             self._fade_total = max(1, round(duration_ms / self._fade_timer.interval()))
             self._fade_timer.start()
-            _log("淡出", "方向=%s 开始，%d 步" % (direction, self._fade_total))
             if on_done:
                 on_done(True)
 
@@ -1592,8 +1582,6 @@ class AudioPlayer(QObject):
                 direction = self._fade_direction
                 self._fade_direction = None
                 self._fade_generation += 1
-                _log("淡出", "方向=%s 完成（pactl 忙跳过，%d 步，用时 %.0fms）"
-                     % (direction, self._fade_step, self._fade_step * 30))
                 if direction == "quit":
                     self._kill_process()
                     if self._quit_callback:
@@ -1614,8 +1602,6 @@ class AudioPlayer(QObject):
             direction = self._fade_direction
             self._fade_direction = None
             self._fade_generation += 1  # 丢弃任何在途的过期命令
-            _log("淡出", "方向=%s 完成（%d 步，用时 %.0fms）"
-                 % (direction, self._fade_step, self._fade_step * 30))
             if direction == "quit":
                 # 退出淡出完成：音量已近 0，终止进程并触发退出回调
                 self._kill_process()
@@ -1672,9 +1658,10 @@ class AudioPlayer(QObject):
         """
         self._kill_process()
         self._process = QProcess()
-        # 捕获 ffplay stderr 并过滤噪音（横幅/元数据不记录，错误进日志）
-        self._process.setProcessChannelMode(QProcess.SeparateChannels)
-        self._process.readyReadStandardError.connect(self._on_ffplay_stderr)
+        # ffplay stderr 直接转发到终端（不拦截不过滤）：横幅/元数据/错误
+        # 原样可见，方便排查。需要按行捕获时改回 SeparateChannels +
+        # readyReadStandardError。
+        self._process.setProcessChannelMode(QProcess.ForwardedErrorChannel)
 
         if use_pa is None:
             use_pa = self._check_pa_available()
@@ -1741,19 +1728,6 @@ class AudioPlayer(QObject):
             pid = self._process.processId()
             if pid > 0:
                 self._last_child_pid = pid
-
-    def _on_ffplay_stderr(self):
-        """转发 ffplay 的 stderr 到日志（过滤横幅/元数据噪音）"""
-        if not self._process:
-            return
-        data = bytes(self._process.readAllStandardError()).decode("utf-8", "replace")
-        for line in data.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if _is_ffplay_noise(line):
-                continue
-            _log("ffplay", stripped)
 
     def _async_load_metadata(self, filepath):
         """后台线程加载歌曲时长（ffprobe），完成后在 GUI 线程回调。
@@ -2953,15 +2927,6 @@ def main():
 
     rc = app.exec()
 
-    # 退出总结：位置定时器滞后统计（诊断"高亮落后"是否由渲染/主线程繁忙导致）
-    try:
-        if player._timer_slow_count:
-            _log("总结", "位置定时器慢触发 %d 次，累计滞后 %.0fms，最大单次 %.0fms"
-                 % (player._timer_slow_count, player._timer_lag_total, player._timer_max_lag))
-        else:
-            _log("总结", "位置定时器全程无滞后（≥100ms 的触发未出现）")
-    except Exception:
-        pass
     return rc
 
 

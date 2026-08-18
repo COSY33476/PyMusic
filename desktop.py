@@ -13,20 +13,31 @@
 Wayland 说明:
   Wayland 协议不允许客户端自我置顶/查询或设置自己窗口的全局坐标，
   Qt.WindowStaysOnTopHint / setPosition 在 Wayland 下会被合成器忽略。
-  因此：
-  - 置顶：不做运行时脚本注入，请引导用户在系统设置 → 窗口管理 →
-    窗口规则 里配置"窗口标题 = 桌面歌词 → 在其它窗口之上 = 强制"。
-  - 位置（拖动后保存 / 启动恢复）：借道运行在合成器内部的 KWin 脚本，
-    通过 org.kde.KWin D-Bus 接口注入一次性脚本，脚本内按标题匹配窗口
-    读写 frameGeometry，并用 callDBus 把真实坐标回调给本进程注册的
-    org.pymusic.DesktopLyric D-Bus 服务（_PositionReceiver）。
-    仅在 KDE + Wayland 且 PySide6.QtDBus 可用时启用，任何一环缺失
-    静默降级（位置退回默认摆位），不影响其它功能。
+  因此按桌面环境分派：
+  - KDE Wayland（默认）：层模式（layer-shell）。窗口是合成器的
+    wlr-layer-shell layer surface（desktop_layer.qml，KDE 系统库
+    org.kde.layershell）：layer=Overlay 天然置顶于所有普通窗口之上，
+    锚定屏幕底边+左边（位置由 margins 决定），键盘不可交互，点击
+    穿透由 WindowTransparentForInput 翻译成的空 input region 实现。
+    可用环境变量 PYMUSIC_DESKTOP_LYRIC_NO_LAYER_SHELL=1 关闭。
+  - 非 KDE Wayland / 层模式加载失败：普通窗口回退（desktop.qml）。
+    置顶只设 Qt flag（合成器通常忽略，建议用窗口规则）；位置借道
+    运行在合成器内部的 KWin 脚本，通过 org.kde.KWin D-Bus 接口注入
+    一次性脚本，脚本内按标题匹配窗口读写 frameGeometry，并用 callDBus
+    把真实坐标回调给本进程注册的 org.pymusic.DesktopLyric D-Bus 服务
+    （_PositionReceiver）。仅在 KDE + Wayland 且 PySide6.QtDBus 可用
+    时启用，任何一环缺失静默降级（位置退回默认摆位）。
 
-鼠标穿透 + 拖动:
-  "锁定歌词"开关（设置面板，持久化 desktopLyricLocked）决定窗口是否
-  点击穿透：锁定 = 不可交互不可拖动；取消锁定 = 左键拖动窗口
-  （QML 侧 startSystemMove）、右键弹出自绘菜单（置顶开关 / 隐藏）。
+鼠标交互与移动:
+  歌词窗口默认是普通窗口（可被 KWin 原生拖动）：左键拖动
+  （startSystemMove）或 Meta+左键 均可；置顶由 KWin 脚本 keepAbove
+  保证（Wayland 下客户端无协议级置顶请求）。
+  "锁定歌词"开关（持久化 desktopLyricLocked）决定点击穿透。
+  位置保存：每 3 秒借道 KWin 脚本查询合成器侧真实坐标落盘（异常退出
+  也不丢位置，可用 PYMUSIC_DESKTOP_LYRIC_SYNC_MS 改间隔），关闭时
+  再兜底一次。
+  层模式（PYMUSIC_DESKTOP_LYRIC_LAYER_SHELL=1，默认关闭）：窗口是
+  layer surface，天然置顶但 KWin 无法移动它（协议硬限制）。
 """
 
 import os
@@ -39,6 +50,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QPoint, QTimer, Signal, Slot, Property, QUrl, Qt, ClassInfo
 from PySide6.QtQuick import QQuickView
+from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QMenu
 try:
@@ -50,6 +62,7 @@ except Exception:
 # 加入入口目录，保证能找到同目录的 main.py（自测时才需要）
 _HERE = Path(__file__).resolve().parent
 _QML_PATH = _HERE / "desktop.qml"
+_QML_LAYER_PATH = _HERE / "desktop_layer.qml"
 
 # 供 KWin 窗口规则匹配的窗口类/标题关键词
 WINDOW_CLASS_HINT = "desktoplyric"
@@ -64,6 +77,54 @@ def _dlog(msg):
         return
     ts = time.strftime("%H:%M:%S")
     print("[desktop][%s] %s" % (ts, msg), file=sys.stderr, flush=True)
+
+
+def _use_layer_shell_mode():
+    """是否启用 Wayland 层模式（KDE layer-shell）。
+
+    默认不启用：层窗口（layer surface）在 KWin 里 isMovableAcrossScreens()
+    = false，KWin 的交互式移动（Meta+左键 强制拖动）对层窗口无效——
+    层窗口永远无法被 KWin 拖动，这是协议层面的硬限制。因此默认走普通
+    窗口（KWin 原生拖动可用，置顶由 keepAbove 脚本保证）。
+
+    仅当显式设置 PYMUSIC_DESKTOP_LYRIC_LAYER_SHELL=1 且处于 KDE Wayland
+    时启用（置顶最可靠，但不可拖动）。QML 加载失败会在
+    DesktopLyrics.__init__ 里回退普通窗口。
+    """
+    if QGuiApplication.platformName() != "wayland":
+        return False
+    if "KDE" not in os.environ.get("XDG_CURRENT_DESKTOP", ""):
+        _dlog("_use_layer_shell_mode: 非 KDE 桌面（%r），不启用层模式"
+              % os.environ.get("XDG_CURRENT_DESKTOP", ""))
+        return False
+    if os.environ.get("PYMUSIC_DESKTOP_LYRIC_LAYER_SHELL") != "1":
+        _dlog("_use_layer_shell_mode: 未设置 PYMUSIC_DESKTOP_LYRIC_LAYER_"
+              "SHELL=1（层窗口不可拖动，默认普通窗口）")
+        return False
+    return True
+
+
+# 普通窗口置顶：KWin 脚本按标题匹配窗口，设置 keepAbove。
+# Wayland 下客户端无法请求置顶（xdg 协议没有该请求），KWin 脚本是
+# 唯一途径；keepAbove 是窗口属性，设置后持续有效。
+_KWIN_SET_KEEP_ABOVE_TEMPLATE = r"""
+function setKeepAbove() {
+    var list = workspace.windowList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (!w) continue;
+        try {
+            if (w.caption === "%(title)s") {
+                w.keepAbove = %(on)s;
+                return;
+            }
+        } catch (e) {
+            // 忽略：不同 KWin 版本 Window API 略有差异
+        }
+    }
+}
+setKeepAbove();
+"""
 
 
 def _run_qdbus(args, timeout=3.0):
@@ -144,11 +205,49 @@ function findAndMove() {
                 return;
             }
         } catch (e) {
-            // 忽略：不同 KWin/Qt 版本 Window API 略有差异
+            // 忽略：不同 KWin/Qt 版本 Window/Client API 略有差异
         }
     }
 }
 findAndMove();
+"""
+
+# 层窗口位置查询：客户端拿不到自己的全局坐标，由合成器内脚本读取真实
+# 坐标，经 callDBus 回调 org.pymusic.DesktopLyric（_PositionReceiver）。
+# 层窗口没有标题，不能按 caption 匹配；匹配条件 = Overlay 层(LAYER=9)
+# + 尺寸相符（歌词窗 900x120 足够独特，且尺寸在层窗口里极少重复）。
+# 不能用"已知位置容差"匹配——用户用 KWin 的 Meta+左键 强制拖动后，
+# 客户端跟踪的位置是旧的（margins 未变），按旧位置匹配会失配。
+# 本脚本只做只读查询，不做任何移动。
+_KWIN_LAYER_QUERY_POSITION_TEMPLATE = r"""
+function reportPos() {
+    var list = workspace.windowList();
+    for (var i = 0; i < list.length; i++) {
+        var w = list[i];
+        if (!w) continue;
+        try {
+            if (w.layer === 9) {
+                var g = w.frameGeometry || w.geometry;
+                if (g
+                    && Math.abs(g.width - %(ow)d) <= 8
+                    && Math.abs(g.height - %(oh)d) <= 8) {
+                    callDBus(
+                        "org.pymusic.DesktopLyric",
+                        "/PositionReceiver",
+                        "org.pymusic.DesktopLyric",
+                        "reportPosition",
+                        Math.round(g.x),
+                        Math.round(g.y)
+                    );
+                    return;
+                }
+            }
+        } catch (e) {
+            // 忽略：不同 KWin/Qt 版本 Window API 略有差异
+        }
+    }
+}
+reportPos();
 """
 
 
@@ -271,6 +370,76 @@ class _KWinPinner:
         self._cleanup_tmp()
         return ok2
 
+    # ---------- 层窗口（layer-shell）专用：拖动移动 / 位置查询 ----------
+    # 层窗口没有标题，KWin 脚本无法按 caption 匹配；拖动时指针位于窗口上，
+    # 用 workspace.windowAt(指针位置) 找最上层 Overlay 层窗口（LAYER=9）。
+    # frameGeometry 写入对层窗口同样生效（moveResizeInternal 同步应用），
+    # 无 wl_surface commit 依赖，不会像改 margins 那样延迟/回拉。
+
+    def _run_script(self, script, prefix):
+        """把脚本写临时文件 -> loadScript -> start -> unloadScript。
+
+        返回 (成功?, 输出)。脚本名唯一，避免同名前一次还没卸载时
+        loadScript 返回 -1 被当成失败。"""
+        try:
+            fd, path = tempfile.mkstemp(prefix=prefix, suffix=".js")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(script)
+        except Exception as e:
+            _dlog("_KWinPinner._run_script: 写临时脚本文件异常: %r" % (e,))
+            return False, ""
+        script_name = "%s-%d" % (prefix, int(time.monotonic() * 1000))
+        ok, out = _run_qdbus([
+            "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.loadScript",
+            path, script_name,
+        ])
+        if ok:
+            ok2, _ = _run_qdbus([
+                "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.start",
+            ])
+        else:
+            ok2 = False
+            _dlog("_KWinPinner._run_script: loadScript 失败")
+        _run_qdbus([
+            "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting.unloadScript",
+            script_name,
+        ])
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return ok and ok2, out
+
+    def layer_query_position(self, ow, oh):
+        """查询"尺寸 (ow, oh)"的 Overlay 层窗口真实坐标（异步）。
+
+        结果经 callDBus 回调 org.pymusic.DesktopLyric /PositionReceiver
+        reportPosition。只读查询，不做移动。"""
+        if not self.is_kde():
+            _dlog("_KWinPinner.layer_query_position: is_kde()=False，跳过")
+            return False
+        script = _KWIN_LAYER_QUERY_POSITION_TEMPLATE % {
+            "ow": int(ow),
+            "oh": int(oh),
+        }
+        ok, _ = self._run_script(script, "pymusic-qpos")
+        return ok
+
+    def set_keep_above(self, on):
+        """通过 KWin 脚本设置/取消普通窗口置顶（keepAbove）。
+
+        Wayland 下客户端无法请求置顶，只有合成器内脚本能改窗口属性。
+        keepAbove 对层窗口无效（Overlay 层天然置顶，无需设置）。"""
+        if not self.is_kde():
+            _dlog("_KWinPinner.set_keep_above: is_kde()=False，跳过")
+            return False
+        script = _KWIN_SET_KEEP_ABOVE_TEMPLATE % {
+            "title": self._title.replace('"', '\\"'),
+            "on": "true" if on else "false",
+        }
+        ok, _ = self._run_script(script, "pymusic-keepabove")
+        return ok
+
     def _cleanup_tmp(self):
         if self._tmp_path:
             try:
@@ -347,6 +516,7 @@ class _LyricBridge(QObject):
         self._groups = []   # 分组缓存 [[(t,text),...], ...]：同时间戳相邻行并为一组
         self._desktop_font = ""   # 桌面歌词字体族（空=默认）
         self._desktop_color = ""  # 桌面歌词当前行颜色（空=默认白）
+        self._drag_mode = "system"  # "system"=普通窗口拖动 / "none"=层窗口不可拖动
 
         if player is not None:
             player.lyricsChanged.connect(self._on_lyrics_changed)
@@ -505,52 +675,105 @@ class _LyricBridge(QObject):
     def showContextMenu(self, x, y):
         self.contextMenuRequested.emit(x, y)
 
-    # ---------- 拖动结束通知（由 desktop.qml 的 MouseArea.onReleased 触发） ----------
-    # QML 层只负责"告诉 Python 一次拖动结束了"，具体怎么去拿 Wayland 下
-    # 客户端本来拿不到的真实窗口坐标（借道 KWin 脚本查询），由 Python
-    # 侧的 DesktopLyrics 处理，QML 不需要关心实现细节。
+    # 拖动结束通知（普通窗口模式由 MouseArea.onReleased 触发，层模式不用）
     dragFinishedSig = Signal()
 
     @Slot()
     def dragFinished(self):
         self.dragFinishedSig.emit()
 
+    # 拖动方式："system"=普通窗口 startSystemMove（合成器原生移动）；
+    # "none"=层窗口不可拖动（layer surface 无法被 KWin 移动）。
+    @Property(str, constant=True)
+    def dragMode(self):
+        return self._drag_mode
+
 
 class DesktopLyrics:
     """桌面歌词窗口控制器：封装一个透明置顶的 QQuickView 并绑定 AudioPlayer。
 
     交互模型（详见模块 docstring）：
-      - "锁定歌词"开启：整窗点击穿透，不可拖动；
-      - 取消锁定：左键拖动整窗，右键弹出自绘菜单（置顶开关 / 隐藏）。
-      - 置顶仅设 Qt flag（X11 生效）；Wayland 下请配置 KWin 窗口规则。
+      - 默认普通窗口：左键拖动（startSystemMove）或 KWin 的 Meta+左键
+        强制拖动均可移动窗口；置顶由 KWin 脚本 keepAbove 保证；
+      - "锁定歌词"开启：整窗点击穿透；
+      - 取消锁定：右键弹出自绘菜单（隐藏）。
+      - 层模式（PYMUSIC_DESKTOP_LYRIC_LAYER_SHELL=1）：窗口不可拖动
+        （layer surface 无法被 KWin 移动，协议硬限制），仅能 Meta+左键
+        尝试（无效），位置在窗口关闭时由 KWin 脚本查询保存。
     """
 
     def __init__(self, player=None, parent=None):
-        # QQuickView 是独立顶层窗口，不进入主 engine 的 rootObjects
-        self._view = QQuickView()
-        self._view.setResizeMode(QQuickView.SizeRootObjectToView)
-
         self._stay_on_top = True  # 右键菜单"置顶显示"状态
-        self._locked = False      # "锁定歌词"；锁定则点击穿透、不可挪动
+        self._locked = False      # "锁定歌词"；锁定则点击穿透
         self._save_pos_cb = None  # 由 _DesktopLyricsManager 注入的"保存位置"回调
         self._desired_pos = None  # 上次保存的窗口位置 (x,y)；None 用默认摆位
         self._suppress_pos_tracking = True  # 程序自摆位期间忽略 xChanged/yChanged
-        self._kwin_pinner = _KWinPinner(WINDOW_TITLE_HINT)
-        self._position_receiver = _PositionReceiver(self._on_kwin_reported_position, self._view)
+        self._view = None         # QQuickWindow（QQuickView 或其子类）
+        self._engine = None       # 层模式时持有 QQmlApplicationEngine
 
+        # KWin 脚本通道 + D-Bus 位置接收器：普通模式置顶/位置恢复、
+        # 拖动结束与关闭时查询真实坐标保存都走这条链路
+        self._kwin_pinner = _KWinPinner(WINDOW_TITLE_HINT)
+        self._position_receiver = _PositionReceiver(
+            self._on_kwin_reported_position, None)
+
+        # 客户端跟踪的窗口位置（合成器真相的副本）：层模式关闭时脚本
+        # 匹配与兜底保存用。普通模式由 view 坐标/KWin 回调维护。
+        self._last_known_pos = None
+        # _last_known_pos 是否经过 KWin 查询验证：只有验证过的才是合成器
+        # 真值，可以写回配置。set_position（恢复目标）设置的是"期望值"，
+        # 配置本身可能是脏数据（如屏幕局部偏移），未经验证就写回会把
+        # 脏值循环下去（自复位偏差的根源之一）。
+        self._pos_verified = False
+
+        # 周期位置同步：每 N 秒借道 KWin 脚本查询窗口真实位置并落盘，
+        # 保证异常退出（未走 close()）也不丢位置。默认 3 秒，可用
+        # PYMUSIC_DESKTOP_LYRIC_SYNC_MS 覆盖。
+        self._pos_sync_ms = int(os.environ.get("PYMUSIC_DESKTOP_LYRIC_SYNC_MS", "3000"))
+        self._pos_sync_timer = QTimer()
+        self._pos_sync_timer.setSingleShot(False)
+        self._pos_sync_timer.setInterval(self._pos_sync_ms)
+        self._pos_sync_timer.timeout.connect(self._periodic_position_sync)
+        self._sync_in_flight = False  # 上一轮查询未回调完成前不叠加
+        self._pos_sync_timer.start()
+
+        # 层模式（KDE Wayland layer-shell，显式开启）：窗口是合成器
+        # layer surface，天然置顶、不可移动。默认普通窗口（可拖动）。
+        self._layer_mode = _use_layer_shell_mode()
+        if self._layer_mode:
+            self._init_layer_window(player)
+        else:
+            self._init_plain_window(player)
+
+        # 初始透明度按当前锁定状态应用（默认未锁定可交互）
+        self._apply_lock()
+
+        _dlog("__init__ 完成，layer_mode=%s，窗口坐标=(%d,%d)；"
+              "_suppress_pos_tracking 仍为 True，manager.ensure() 稍后会在"
+              "真正应用完保存的位置之后才关闭它"
+              % (self._layer_mode, self._view.x(), self._view.y()))
+
+    # ---------- 窗口初始化 ----------
+
+    def _init_plain_window(self, player):
+        """普通窗口模式：QQuickView + desktop.qml（Item 根）。
+
+        无边框 + 置顶 + 不抢焦点 + 工具窗（不占任务栏）。
+        WindowTransparentForInput 随"锁定歌词"开关决定；置顶 flag 仅 X11
+        生效，Wayland 下由合成器窗口规则或层模式负责。
+        """
         # 拖动位置去抖保存：拖动中 x/y 高频触发，停手 400ms 后才写一次配置
-        self._pos_timer = QTimer(self._view)
+        self._pos_timer = QTimer()
         self._pos_timer.setSingleShot(True)
         self._pos_timer.setInterval(400)
         self._pos_timer.timeout.connect(self._save_position)
         # show 后分几次延迟重试 KWin 脚本恢复位置（窗口需先被 KWin 注册）
         self._restore_pending = False
         self._restore_remaining = 0
-        self._view.xChanged.connect(self._on_position_changed)
-        self._view.yChanged.connect(self._on_position_changed)
 
-        # 无边框 + 置顶 + 不抢焦点 + 工具窗（不占任务栏）。
-        # WindowTransparentForInput 随"锁定歌词"开关决定；置顶 flag 仅 X11 生效。
+        # QQuickView 是独立顶层窗口，不进入主 engine 的 rootObjects
+        self._view = QQuickView()
+        self._view.setResizeMode(QQuickView.SizeRootObjectToView)
         self._view.setFlags(
             Qt.Window
             | Qt.FramelessWindowHint
@@ -562,12 +785,10 @@ class DesktopLyrics:
         self._view.setColor("transparent")
         self._view.setTitle(WINDOW_TITLE_HINT)
         self._view.setObjectName(WINDOW_CLASS_HINT)
+        self._view.xChanged.connect(self._on_position_changed)
+        self._view.yChanged.connect(self._on_position_changed)
 
-        # 桥接对象
-        self._bridge = _LyricBridge(player, self._view)
-        self._bridge.contextMenuRequested.connect(self._on_context_menu_requested)
-        self._bridge.dragFinishedSig.connect(self._on_drag_finished)
-        self._view.rootContext().setContextProperty("player", self._bridge)
+        self._init_bridge(player)
         self._view.setSource(QUrl.fromLocalFile(str(_QML_PATH)))
 
         # 尺寸跟随 QML (SizeRootObjectToView)
@@ -580,13 +801,84 @@ class DesktopLyrics:
         # 拖动"记录/保存，否则去抖定时器可能把默认坐标误写回配置。
         self._place_default()
 
-        # 初始透明度按当前锁定状态应用（默认未锁定可拖动）
-        self._apply_lock()
+    def _init_layer_window(self, player):
+        """层模式：QQmlApplicationEngine + desktop_layer.qml（Window 根）。
 
-        # 置顶不做运行时脚本注入：Wayland 用窗口规则，X11 用 Qt flag
-        _dlog("__init__ 完成，构造期间的默认摆位坐标=(%d,%d)；"
-              "_suppress_pos_tracking 仍为 True，manager.ensure() 稍后会在"
-              "真正应用完保存的位置之后才关闭它" % (self._view.x(), self._view.y()))
+        Window 根元素 + org.kde.layershell 附加属性（LayerOverlay /
+        AnchorBottom|Left）由合成器置顶与定位：位置 = 锚定边 + margins。
+        拖动期间由 KWin 脚本直接写 frameGeometry 移动窗口（drag_mode=
+        "kwin"），不动 margins——避免 commit 延迟与回拉；拖动结束/关闭时
+        用脚本查询真实坐标保存。
+        QML 加载失败（模块缺失等）时回退普通窗口。
+        """
+        self._engine = QQmlApplicationEngine()
+        self._init_bridge(player)
+        _load_errors = []
+        self._engine.warnings.connect(
+            lambda errs: _load_errors.extend(str(e.toString()) for e in errs))
+        self._engine.load(QUrl.fromLocalFile(str(_QML_LAYER_PATH)))
+        if not self._engine.rootObjects():
+            _dlog("_init_layer_window: 加载 desktop_layer.qml 失败（%s），"
+                  "回退普通窗口模式" % (_load_errors or "无错误信息",))
+            self._engine = None
+            self._layer_mode = False
+            self._init_plain_window(player)
+            return
+        self._view = self._engine.rootObjects()[0]
+        # 层窗口已由 layer-shell 保证无边框/不抢焦点/不占任务栏，
+        # flag 只需要最小集合（WindowTransparentForInput 由锁定开关控制）
+        self._view.setFlags(Qt.Window | Qt.FramelessWindowHint)
+        self._view.setColor("transparent")
+        self._view.setTitle(WINDOW_TITLE_HINT)
+        self._view.setObjectName(WINDOW_CLASS_HINT)
+        # 默认摆位（底部居中）换算成 margins；_desired_pos 保持 None，
+        # 与普通模式语义一致（manager.ensure() 会在有存档时 set_position）
+        self._place_default()
+        # 初始化位置跟踪：以边距换算的位置作为"已知位置"
+        self._sync_last_known_pos()
+        _dlog("_init_layer_window: 层模式初始化完成，flags=%s，默认边距 "
+              "marginLeft=%d marginBottom=%d，跟踪位置=%s"
+              % (self._view.flags(),
+                 self._view.property("marginLeft"), self._view.property("marginBottom"),
+                 self._last_known_pos))
+
+    def _init_bridge(self, player):
+        """桥接对象：QML 侧的 player 上下文属性 + 菜单/拖动信号转发。"""
+        self._bridge = _LyricBridge(player, self._view)
+        self._bridge._drag_mode = "none" if self._layer_mode else "system"
+        self._bridge.contextMenuRequested.connect(self._on_context_menu_requested)
+        self._bridge.dragFinishedSig.connect(self._on_drag_finished)
+        # 普通模式挂在 QQuickView 的 rootContext，层模式挂在 engine 的
+        # rootContext；两者必须在 load/setSource 之前注入
+        if self._engine is not None:
+            self._engine.rootContext().setContextProperty("player", self._bridge)
+        else:
+            self._view.rootContext().setContextProperty("player", self._bridge)
+
+    # ---------- 拖动结束（普通窗口模式）-> 借道 KWin 脚本查询真实坐标 ----------
+
+    def _on_drag_finished(self):
+        """左键拖动结束（QML MouseArea.onReleased，仅普通窗口模式）。
+
+        Wayland 下 self._view.x()/y() 不会随 startSystemMove 拖动更新，
+        直接 _save_position() 存的是旧坐标，必须借道 KWin 脚本查询真实
+        坐标（异步回调 _on_kwin_reported_position）。X11 下读数准确，
+        直接兜底保存。"""
+        if self._layer_mode:
+            return
+        _dlog("_on_drag_finished: 收到拖动结束通知，当前 self._view.x/y()="
+              "(%d,%d)（Wayland 下这个读数在拖动后大概率是不准的，仅供"
+              "参考，真实坐标要等下面 KWin 查询的回调）"
+              % (self._view.x(), self._view.y()))
+        if not self._kwin_pinner.is_kde():
+            self._save_position()
+            return
+        import threading
+        t = threading.Thread(
+            target=self._kwin_pinner.query_position,
+            daemon=True,
+        )
+        t.start()
 
     # ---------- 右键菜单 ----------
 
@@ -596,49 +888,82 @@ class DesktopLyrics:
         menu = QMenu()
         menu.setWindowFlags(menu.windowFlags() | Qt.FramelessWindowHint)
 
-        top_action = menu.addAction("置顶显示")
-        top_action.setCheckable(True)
-        top_action.setChecked(self._stay_on_top)
-        top_action.toggled.connect(self._set_stay_on_top)
-
-        menu.addSeparator()
+        if not self._layer_mode:
+            # 层模式天然置顶（LayerOverlay），置顶开关没有意义，不显示
+            top_action = menu.addAction("置顶显示")
+            top_action.setCheckable(True)
+            top_action.setChecked(self._stay_on_top)
+            top_action.toggled.connect(self._set_stay_on_top)
+            menu.addSeparator()
         hide_action = menu.addAction("隐藏桌面歌词")
         hide_action.triggered.connect(self.hide)
 
         # 用 exec 而不是 show，保证是模态弹出、点外部自动关闭
         menu.exec(QPoint(int(x), int(y)))
 
-    # ---------- 拖动结束 -> 借道 KWin 脚本查询真实坐标 ----------
+    # ---------- KWin 脚本查询真实坐标（周期同步/关闭时保存位置用） ----------
 
-    def _on_drag_finished(self):
-        """一次左键拖动结束（QML MouseArea.onReleased）。
+    def _periodic_position_sync(self):
+        """每 3 秒把窗口位置同步到配置（定时器回调）。
 
-        Wayland 下 self._view.x()/y() 不会随 startSystemMove 拖动更新，
-        直接 _save_position() 存的是旧坐标，必须借道 KWin 脚本查询真实
-        坐标（异步回调 _on_kwin_reported_position）。X11 下读数准确，
-        直接兜底保存。"""
-        _dlog("_on_drag_finished: 收到拖动结束通知，当前 self._view.x/y()="
-              "(%d,%d)（Wayland 下这个读数在拖动后大概率是不准的，仅供"
-              "参考，真实坐标要等下面 KWin 查询的回调）"
-              % (self._view.x(), self._view.y()))
+        目的：歌词位置只在 close()（干净退出）时保存，而大部分时候程序
+        是被直接关掉/杀掉的，配置里一直是旧位置。这里定时借道 KWin 脚本
+        查询合成器侧真实坐标，经 reportPosition 回调落盘——异常退出也
+        不丢位置，下次启动自复位准确。
+
+        窗口未显示时跳过；X11 下 view 坐标准确，直接存，不跑脚本。
+        """
+        if self._sync_in_flight:
+            return
+        if self._view is None or not self._view.isVisible():
+            return
         if not self._kwin_pinner.is_kde():
+            # X11：view 坐标准确，直接落盘
             self._save_position()
             return
-        self._query_position_async()
-
-    def _query_position_async(self):
-        """后台线程调 query_position（subprocess 不阻塞 UI）；真实坐标经
-        reportPosition 异步回调，不是本函数返回值。"""
+        self._sync_in_flight = True
         import threading
+        if self._layer_mode:
+            w, h = self._view.width(), self._view.height()
+            target = self._kwin_pinner.layer_query_position
+            args = (w, h)
+        else:
+            target = self._kwin_pinner.query_position
+            args = ()
+        # 线程结束（脚本执行完）即释放闸门；回调落盘是幂等的，
+        # 与下一轮查询重叠最多一次，无副作用
         t = threading.Thread(
-            target=self._kwin_pinner.query_position,
+            target=self._run_sync_query,
+            args=(target, args),
+            daemon=True,
+        )
+        t.start()
+        _dlog("_periodic_position_sync: 发起 KWin 位置查询")
+
+    def _run_sync_query(self, target, args):
+        """后台执行 KWin 查询脚本；无论成败都释放周期同步闸门。"""
+        try:
+            target(*args)
+        except Exception as e:
+            _dlog("_run_sync_query 异常: %r" % (e,))
+        finally:
+            self._sync_in_flight = False
+
+    def _query_layer_position_async(self):
+        """后台线程调 layer_query_position：按尺寸匹配层窗口，
+        查询其真实坐标，经 reportPosition 异步回调落盘。"""
+        import threading
+        w, h = self._view.width(), self._view.height()
+        t = threading.Thread(
+            target=self._kwin_pinner.layer_query_position,
+            args=(w, h),
             daemon=True,
         )
         t.start()
 
     def _on_kwin_reported_position(self, x, y):
         """收到 KWin 回调的真实坐标（Wayland 下唯一权威来源），
-        更新 _desired_pos 并落盘。"""
+        更新 _desired_pos / _last_known_pos 并落盘。"""
         _dlog("_on_kwin_reported_position: 收到 KWin 回调的真实坐标 "
               "(%d, %d)，与 self._view 读数 (%d, %d) 对比"
               "%s，以 KWin 回调值为准写入配置"
@@ -646,9 +971,12 @@ class DesktopLyrics:
                  "一致" if (x, y) == (self._view.x(), self._view.y())
                  else "不一致（符合预期，Wayland 下 QWindow 读数本来就不可靠）"))
         # 停掉残留去抖定时器：避免稍后用不可靠的 self._view 读数覆盖权威坐标
-        if self._pos_timer.isActive():
+        if not self._layer_mode and self._pos_timer.isActive():
             self._pos_timer.stop()
         self._desired_pos = (int(x), int(y))
+        # 以合成器真相更新跟踪位置（两种模式一致），并标记已验证
+        self._last_known_pos = (int(x), int(y))
+        self._pos_verified = True
         if self._save_pos_cb is not None:
             self._save_pos_cb("desktopLyricPosX", str(int(x)))
             self._save_pos_cb("desktopLyricPosY", str(int(y)))
@@ -660,7 +988,12 @@ class DesktopLyrics:
 
     def _set_stay_on_top(self, on):
         """右键菜单"置顶显示"：设 Qt.WindowStaysOnTopHint 并 raise 一次。
-        X11 生效；Wayland 忽略该 flag，置顶请走窗口规则。"""
+        X11 生效；Wayland 忽略该 flag，置顶请走窗口规则。
+        层模式下不做任何事（LayerOverlay 天然置顶）。"""
+        if self._layer_mode:
+            _dlog("_set_stay_on_top(%s): 层模式下置顶由合成器保证，忽略"
+                  % (on,))
+            return
         self._stay_on_top = bool(on)
         self._view.setFlag(Qt.WindowStaysOnTopHint, self._stay_on_top)
         if self._stay_on_top:
@@ -668,7 +1001,22 @@ class DesktopLyrics:
             self._view.raise_()
 
     def _place_default(self):
-        """主屏幕底部居中的默认摆位。"""
+        """主屏幕底部居中的默认摆位。层模式下换算成 margins 交给合成器。"""
+        if self._layer_mode:
+            try:
+                screen = self._current_screen()
+                geo = self._screen_geometry(screen)
+                w, h = self._view.width(), self._view.height()
+                ml, mb = self._margins_from_pos(geo.x() + (geo.width() - w) // 2,
+                                                geo.y() + geo.height() - h - 48,
+                                                screen=screen)
+                _dlog("_place_default: 层模式默认边距 marginLeft=%d "
+                      "marginBottom=%d（窗口 %dx%d，屏幕 %s）"
+                      % (ml, mb, w, h, geo))
+                self._set_layer_margins(ml, mb, screen=screen)
+            except Exception as e:
+                _dlog("_place_default 层模式异常: %r" % (e,))
+            return
         try:
             screen = QGuiApplication.primaryScreen()
             if screen is None:
@@ -684,10 +1032,130 @@ class DesktopLyrics:
         except Exception as e:
             _dlog("_place_default 异常: %r" % (e,))
 
+    # ---------- 层模式边距 <-> 屏幕坐标换算 ----------
+    #
+    # layer-shell 的 margins 是"相对某一个具体输出（screen）"的锚定边距，
+    # 不是相对整个虚拟桌面。之前的实现永远用 QGuiApplication.primaryScreen()
+    # 换算，等价于把窗口焊死在主屏——margins 只在 [0, 主屏宽/高] 内取值
+    # 有意义，副屏坐标换算出来的 margins 要么被钳成负数要么被
+    # _set_layer_margins 直接夹回主屏范围，窗口当然拖不过去。
+    # 这里改成：换算前先按"窗口当前落在哪个 QScreen 上"取该屏的
+    # availableGeometry，边距就是"相对那块屏"的边距；QWindow 本身的
+    # screen() 由 Qt/合成器根据窗口几何自动跟随（层窗口在 KDE Wayland
+    # 下拖过输出边界，KWin 会把它重新分配到新的输出），所以不需要手动
+    # setScreen，只需要换算时用对屏幕。
+
+    def _current_screen(self):
+        """窗口当前所在的 QScreen；取不到则退回主屏。"""
+        screen = None
+        try:
+            screen = self._view.screen()
+        except Exception:
+            screen = None
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        return screen
+
+    def _screen_at(self, global_x, global_y):
+        """全局坐标 (x, y) 所在的 QScreen；取不到则退回当前屏幕。"""
+        try:
+            from PySide6.QtCore import QPoint as _QPoint
+            screen = QGuiApplication.screenAt(_QPoint(int(global_x), int(global_y)))
+            if screen is not None:
+                return screen
+        except Exception:
+            pass
+        return self._current_screen()
+
+    def _screen_geometry(self, screen=None):
+        """指定屏幕（默认取窗口当前所在屏）的可用区域（逻辑坐标）。"""
+        if screen is None:
+            screen = self._current_screen()
+        if screen is None:
+            return None
+        return screen.availableGeometry()
+
+    def _set_layer_margins(self, ml, mb, screen=None):
+        """应用层窗口边距（锚定 Bottom|Left，窗口位置由边距唯一确定）。
+
+        限制在目标屏幕范围内：把窗口完全拖出该屏幕的边距没有意义，KWin
+        也会钳制。通过 QML 声明的 marginLeft/marginBottom 属性写回，
+        绑定链同步到 LayerShell.Window.margins.*。
+
+        关键：wlr-layer-shell 的 set_margin 要等下一次 wl_surface commit
+        合成器才应用，而静态画面 Qt 不会重绘/提交——实测没有强制提交时
+        边距更新会一直积压，直到某次切歌词重绘才一次性跳转（约 1~2 秒
+        延迟）。每次写边距后调 QWindow.requestUpdate() 强制排一帧渲染，
+        让合成器 ~100ms 内就应用，拖动才能实时跟手。
+        """
+        geo = self._screen_geometry(screen)
+        if geo is not None:
+            w, h = self._view.width(), self._view.height()
+            ml = max(0, min(ml, geo.width() - w))
+            mb = max(0, min(mb, geo.height() - h))
+        self._view.setProperty("marginLeft", int(ml))
+        self._view.setProperty("marginBottom", int(mb))
+        self._view.requestUpdate()
+
+    def _layer_margins(self):
+        """当前层窗口边距（以最近一次设置为准）。"""
+        return (int(self._view.property("marginLeft")),
+                int(self._view.property("marginBottom")))
+
+    def _margins_from_pos(self, x, y, screen=None):
+        """窗口左上角屏幕坐标 (x, y) -> 层模式边距 (marginLeft, marginBottom)。
+
+        锚定 Bottom|Left：窗口左边缘距屏幕左缘 = marginLeft；
+        窗口底边缘距屏幕底缘 = marginBottom。默认按 (x, y) 所在的屏幕
+        换算（拖到副屏时不能仍然按主屏算，否则边距会越界被钳掉）。
+        """
+        if screen is None:
+            screen = self._screen_at(x, y)
+        geo = self._screen_geometry(screen)
+        if geo is None:
+            return 0, 0
+        w, h = self._view.width(), self._view.height()
+        ml = int(x) - geo.x()
+        mb = (geo.y() + geo.height()) - int(y) - h
+        return max(0, ml), max(0, mb)
+
+    def _pos_from_margins(self, ml, mb, screen=None):
+        """层模式边距 -> 窗口左上角屏幕坐标。"""
+        geo = self._screen_geometry(screen)
+        if geo is None:
+            return 0, 0
+        w, h = self._view.width(), self._view.height()
+        return (geo.x() + ml, geo.y() + geo.height() - mb - h)
+
+    # ---------- 层模式拖动：margins 移动 + 客户端位置跟踪 ----------
+
+    def _sync_last_known_pos(self):
+        """把"已知位置"同步为当前边距对应的位置（初始摆位/恢复时用）。"""
+        if self._last_known_pos is None:
+            ml, mb = self._layer_margins()
+            self._last_known_pos = self._pos_from_margins(ml, mb)
+            _dlog("_sync_last_known_pos: 初始化跟踪位置 = %s（边距 %d,%d）"
+                  % (self._last_known_pos, ml, mb))
+
     def set_position(self, x, y):
         """记录上次保存的窗口位置并立即尝试应用（窗口未显示时 Wayland
-        合成器会忽略 setPosition，真正生效靠 show 后的 _place_desired）。"""
+        合成器会忽略 setPosition，真正生效靠 show 后的 _place_desired）。
+        层模式下换算成边距直接生效（锚定定位，无需等 show）。
+
+        注意：这里收到的是"配置里存的位置"，恢复语义由调用方保证为全局
+        坐标（KWin 脚本 frameGeometry 是全局坐标，配置文件里的值必须
+        与之一致，否则窗口会被摆到错误位置/错误屏幕）。"""
         self._desired_pos = (int(x), int(y))
+        # 跟踪位置同步为恢复目标（KWin 查询回调到达前的最新已知值）；
+        # 这是"期望值"不是"真值"，标记为未验证，禁止直接写回配置
+        self._last_known_pos = (int(x), int(y))
+        self._pos_verified = False
+        if self._layer_mode:
+            ml, mb = self._margins_from_pos(int(x), int(y))
+            _dlog("set_position(%d, %d): 层模式换算边距 marginLeft=%d "
+                  "marginBottom=%d" % (int(x), int(y), ml, mb))
+            self._set_layer_margins(ml, mb)
+            return
         _dlog("set_position(%d, %d) 记录目标位置，立即尝试 setPosition "
               "(窗口是否已 show: %s)" % (self._desired_pos[0], self._desired_pos[1],
                                        self._view.isVisible()))
@@ -699,7 +1167,9 @@ class DesktopLyrics:
             _dlog("set_position -> setPosition 抛出异常: %r" % (e,))
 
     def _place_desired(self):
-        """show 后窗口已映射时补一次 setPosition。"""
+        """show 后窗口已映射时补一次 setPosition。层模式跳过。"""
+        if self._layer_mode:
+            return
         if self._desired_pos is None:
             return
         _dlog("_place_desired: 补一次 setPosition%s，补位前实际坐标 (x=%d, y=%d)"
@@ -716,6 +1186,9 @@ class DesktopLyrics:
         # _suppress_pos_tracking 为 True 时是程序自己在摆位（默认摆位 /
         # 恢复保存位置），忽略——否则会把默认坐标误记进 _desired_pos 并
         # 起一个 400ms 后可能把默认坐标写回配置的定时器。
+        # 层模式下该信号不连接（窗口不可拖动），此守卫为防御性代码。
+        if self._layer_mode:
+            return
         if self._suppress_pos_tracking:
             try:
                 _dlog("xChanged/yChanged 触发但 _suppress_pos_tracking=True，"
@@ -734,17 +1207,60 @@ class DesktopLyrics:
         self._pos_timer.start()
 
     def _save_position(self):
-        """把当前窗口坐标写入配置（经 manager 注入的 _save_pos_cb）。"""
+        """把当前窗口坐标写入配置（经 manager 注入的 _save_pos_cb）。
+
+        坐标必须与恢复语义一致（全局坐标）。Wayland 下优先用
+        _last_known_pos（KWin 查询回调/恢复目标的合成器侧真相），
+        QWindow.x()/y() 只是客户端缓存，不可靠；X11 下 view 坐标准确。
+        层模式同样用 _last_known_pos。
+
+        只有经过 KWin 查询验证（_pos_verified）的位置才写回配置：
+        set_position 得到的恢复目标可能本身就是脏配置（例如屏幕局部
+        偏移），直接写回会让脏值循环。未验证时跳过（保留旧配置），
+        等 close() 的 KWin 查询回调写入真值。"""
+        if self._layer_mode:
+            try:
+                if self._last_known_pos is None:
+                    return
+                if not self._pos_verified:
+                    _dlog("_save_position: 层模式跟踪位置 (%d, %d) 未经验证"
+                          "（仅为恢复目标/期望值），不写回配置"
+                          % self._last_known_pos)
+                    return
+                x, y = self._last_known_pos
+                self._desired_pos = (x, y)
+                if self._save_pos_cb is not None:
+                    self._save_pos_cb("desktopLyricPosX", str(int(x)))
+                    self._save_pos_cb("desktopLyricPosY", str(int(y)))
+                    _dlog("_save_position: 层模式按跟踪位置 (%d, %d) 写入配置"
+                          % (x, y))
+                return
+            except Exception as e:
+                _dlog("_save_position 层模式异常: %r" % (e,))
+                return
         try:
-            x, y = self._view.x(), self._view.y()
+            if self._kwin_pinner.is_kde():
+                # Wayland：仅写 KWin 查询验证过的真值
+                if self._pos_verified and self._last_known_pos is not None:
+                    x, y = self._last_known_pos
+                    _dlog("_save_position: Wayland 用 KWin 验证位置 (%d, %d)"
+                          "（view 读数 (%d,%d) 仅客户端缓存，忽略）"
+                          % (x, y, self._view.x(), self._view.y()))
+                else:
+                    _dlog("_save_position: 位置未经验证（恢复目标/无查询"
+                          "回调），不写回配置")
+                    return
+            else:
+                # X11：view 坐标准确
+                x, y = self._view.x(), self._view.y()
             self._desired_pos = (x, y)
             if self._save_pos_cb is not None:
                 self._save_pos_cb("desktopLyricPosX", str(int(x)))
                 self._save_pos_cb("desktopLyricPosY", str(int(y)))
-                _dlog("_save_position: 去抖到期，写入配置 "
+                _dlog("_save_position: 写入配置 "
                       "desktopLyricPosX=%d desktopLyricPosY=%d" % (x, y))
             else:
-                _dlog("_save_position: 去抖到期，但 _save_pos_cb 是 None，"
+                _dlog("_save_position: _save_pos_cb 为 None，"
                       "本次坐标 (%d, %d) 没有写进配置！" % (x, y))
         except Exception as e:
             _dlog("_save_position 异常: %r" % (e,))
@@ -752,10 +1268,18 @@ class DesktopLyrics:
     # ---------- 对外控制 ----------
 
     def _apply_lock(self):
-        """按 _locked 设置点击穿透 flag：锁定 → 穿透（不可拖动/弹菜单）；
-        取消锁定 → 可交互（左键拖动，右键弹菜单）。"""
+        """按 _locked 设置点击穿透 flag：锁定 → 穿透；取消锁定 → 可交互。
+
+        Wayland 下 Qt.WindowTransparentForInput 被 QtWayland 翻译成
+        wl_surface.set_input_region（锁定=空 region，解锁=nil/全区域），
+        但该请求要等下一次 wl_surface commit 才被合成器应用——静态画面
+        不会自动重绘/提交，实测开关"锁定歌词"后输入区域可能一直停在旧
+        状态（表现为窗口点不到/点不到恢复）。每次切换后强制 requestUpdate
+        排一帧渲染，让穿透状态立即生效。
+        """
         try:
             self._view.setFlag(Qt.WindowTransparentForInput, self._locked)
+            self._view.requestUpdate()
         except Exception:
             pass
 
@@ -773,23 +1297,31 @@ class DesktopLyrics:
         正式打开用户拖动的坐标跟踪/去抖保存。在这之前的所有 setPosition
         （构造函数默认摆位、ensure 里恢复保存坐标）都不应被当成"用户拖动"
         记录下来，否则会有极小概率被 400ms 去抖定时器误当成新位置写回配置，
-        参见 _on_position_changed 里的详细说明。"""
+        参见 _on_position_changed 里的详细说明。层模式无位置跟踪，跳过。"""
+        if self._layer_mode:
+            _dlog("begin_position_tracking: 层模式，无位置跟踪")
+            return
         self._suppress_pos_tracking = False
         _dlog("begin_position_tracking: 正式开始跟踪用户拖动，"
               "当前 _desired_pos=%s，当前 view 坐标=(%d,%d)"
               % (self._desired_pos, self._view.x(), self._view.y()))
 
     def show(self):
-        """显示窗口并安排位置恢复（setEnabled(True) 的内部实现）。"""
+        """显示窗口并安排位置恢复（setEnabled(True) 的内部实现）。
+        层模式下没有位置恢复与 KWin 脚本。"""
         _dlog("show() 调用，调用前 _desired_pos=%s，调用前 view 坐标=(%d,%d)"
               % (self._desired_pos, self._view.x(), self._view.y()))
         self._view.show()
         _dlog("show() -> QQuickView.show() 之后坐标=(%d,%d)"
               % (self._view.x(), self._view.y()))
+        if self._layer_mode:
+            return
         # Wayland 下客户端 setPosition 只更新本地缓存，真正落位靠
-        # _schedule_restore 的 KWin 脚本移动；置顶由窗口规则负责。
+        # _schedule_restore 的 KWin 脚本移动；置顶靠 keepAbove 脚本
+        # （普通窗口没有协议级置顶请求）。
         self._place_desired_after_show()
         self._schedule_restore()
+        self._schedule_keep_above()
 
     def hide(self):
         _dlog("hide() 调用")
@@ -808,16 +1340,19 @@ class DesktopLyrics:
             self.show()
         else:
             self._view.hide()
-        # 只在"置顶显示"开关为真时才设 flag，避免关掉置顶后又被重新打开
-        self._view.setFlag(Qt.WindowStaysOnTopHint, enabled and self._stay_on_top)
-        # 切歌/恢复显示时重新 raise（部分 WM 需要）
-        if enabled and self._stay_on_top:
-            self._view.raise_()
+        if not self._layer_mode:
+            # 只在"置顶显示"开关为真时才设 flag，避免关掉置顶后又被重新打开
+            self._view.setFlag(Qt.WindowStaysOnTopHint, enabled and self._stay_on_top)
+            # 切歌/恢复显示时重新 raise（部分 WM 需要）
+            if enabled and self._stay_on_top:
+                self._view.raise_()
         # 显示/隐藏后重新应用锁定状态（Wayland 下 flag 可能在 show 时重建）
         self._apply_lock()
 
     def _place_desired_after_show(self, delay_ms=120):
-        """延迟 delay_ms 在窗口已映射后补一次 setPosition。"""
+        """延迟 delay_ms 在窗口已映射后补一次 setPosition。层模式跳过。"""
+        if self._layer_mode:
+            return
         if self._desired_pos is None:
             return
         _dlog("_place_desired_after_show: 安排 %dms 后补位到 %s"
@@ -835,7 +1370,10 @@ class DesktopLyrics:
         是脚本直接写 frameGeometry（_KWinPinner.set_position）。窗口 show
         后需几百毫秒才被 KWin 注册（标题匹配才有效），所以 700/1400/2100ms
         各试一次；hide→show 连续触发用 _restore_pending 合并为同一轮。
+        层模式下位置由合成器锚定，跳过。
         """
+        if self._layer_mode:
+            return
         if self._desired_pos is None:
             return
         if not self._kwin_pinner.is_kde():
@@ -871,16 +1409,88 @@ class DesktopLyrics:
         )
         t.start()
 
+    def _schedule_keep_above(self):
+        """show 后分几次延迟调 KWin 脚本设置 keepAbove 置顶。
+
+        窗口 show 后需几百毫秒才被 KWin 注册（标题匹配才有效），所以
+        500/1200ms 各试一次。仅普通窗口 + KDE Wayland 需要（层窗口
+        天然置顶；X11 用 WindowStaysOnTopHint）。"""
+        if self._layer_mode:
+            return
+        if not self._kwin_pinner.is_kde():
+            return
+        if not self._stay_on_top:
+            return
+        _dlog("_schedule_keep_above: show 后 500/1200ms 各尝试一次 KWin "
+              "脚本设置 keepAbove")
+        for delay in (500, 1200):
+            t = QTimer(self._view)
+            t.setSingleShot(True)
+            t.setInterval(delay)
+            t.timeout.connect(self._keep_above_async)
+            t.start()
+
+    def _keep_above_async(self):
+        """后台线程调 set_keep_above（subprocess 不阻塞 UI）。"""
+        import threading
+        t = threading.Thread(
+            target=self._kwin_pinner.set_keep_above,
+            args=(True,),
+            daemon=True,
+        )
+        t.start()
+
     def raiseWindow(self):
         self._view.raise_()
 
     # 供 main.py 在退出时调用，归还 QML 资源
     def close(self):
-        # 退出前兜底保存一次当前位置（防极端情况如立刻退出丢位置）
+        """退出前保存窗口位置：借道 KWin 脚本查询合成器侧真实坐标
+        （Wayland 下客户端拿不到自己的全局位置），回调
+        _on_kwin_reported_position 落盘；回调到达前先用跟踪坐标兜底，
+        随后给 D-Bus 回调留出处理时间。
+
+        普通窗口按标题匹配查询（query_position），层窗口按尺寸匹配
+        （layer_query_position）；两种模式都必须走 KWin 查询——
+        QWindow.x()/y() 在 Wayland 下只是客户端缓存，直接存会写入
+        错误位置（自复位偏差的根源）。"""
+        _dlog("close(): 开始保存位置（当前跟踪位置=%s，view 读数=(%d,%d)）"
+              % (self._last_known_pos, self._view.x(), self._view.y()))
+        # 先同步保存跟踪坐标（防极端情况如立刻退出丢位置；
+        # Wayland 下 _save_position 已按 KWin 侧真相取值）
         try:
             self._save_position()
         except Exception:
             pass
+        if self._kwin_pinner.is_kde():
+            try:
+                # 用脚本查询合成器侧真实坐标，权威结果经回调覆盖写入配置。
+                # 3 秒周期同步已保证位置最新，这里只做最后一次尽力确认，
+                # 等待窗口必须尽量短——退出时阻塞太久会让主窗口 QML 在
+                # 销毁期间继续跑（报 appBridge 空引用错误），也拖慢退出。
+                import threading
+                if self._layer_mode:
+                    w, h = self._view.width(), self._view.height()
+                    t = threading.Thread(
+                        target=self._kwin_pinner.layer_query_position,
+                        args=(w, h),
+                        daemon=True,
+                    )
+                else:
+                    t = threading.Thread(
+                        target=self._kwin_pinner.query_position,
+                        daemon=True,
+                    )
+                t.start()
+                # 最多等 0.3s 让 D-Bus 回调落地；没等到就用周期同步的值
+                from PySide6.QtCore import QCoreApplication, QEventLoop
+                deadline = time.monotonic() + 0.3
+                while time.monotonic() < deadline:
+                    QCoreApplication.processEvents(
+                        QEventLoop.ProcessEventsFlag.AllEvents, 50)
+                    time.sleep(0.02)
+            except Exception as e:
+                _dlog("close() 位置查询异常: %r" % (e,))
         self._view.close()
 
 
